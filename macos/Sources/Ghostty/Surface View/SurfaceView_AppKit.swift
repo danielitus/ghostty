@@ -140,6 +140,13 @@ extension Ghostty {
                 } else {
                     input.removeScoped(id)
                 }
+
+                // Offer the password manager when a password prompt is
+                // detected on the focused surface (opt-in via its toggle).
+                if focused || !passwordInput {
+                    PasswordManagerController.shared.passwordPromptDetected(
+                        on: self, active: passwordInput)
+                }
             }
         }
 

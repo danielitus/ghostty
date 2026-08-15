@@ -111,6 +111,12 @@
                                     <action selector="toggleSecureInput:" target="bbz-4X-AYv" id="vWx-z8-5Sy"/>
                                 </connections>
                             </menuItem>
+                            <menuItem title="Password Manager…" keyEquivalent="f" id="pWm-Gr-001">
+                                <modifierMask key="keyEquivalentModifierMask" option="YES" command="YES"/>
+                                <connections>
+                                    <action selector="togglePasswordManager:" target="bbz-4X-AYv" id="pWm-Gr-002"/>
+                                </connections>
+                            </menuItem>
                             <menuItem title="Make Ghostty the Default Terminal" id="b1t-oB-7MI" userLabel="Set Ghostty as Default Terminal App">
                                 <modifierMask key="keyEquivalentModifierMask"/>
                                 <connections>

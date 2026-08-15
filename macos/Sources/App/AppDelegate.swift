@@ -981,6 +981,10 @@ class AppDelegate: NSObject,
         setSecureInput(.toggle)
     }
 
+    @IBAction func togglePasswordManager(_ sender: Any) {
+        PasswordManagerController.shared.toggle()
+    }
+
     @IBAction func toggleQuickTerminal(_ sender: Any) {
         quickController.toggle()
     }
