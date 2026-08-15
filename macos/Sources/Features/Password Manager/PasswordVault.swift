@@ -102,6 +102,22 @@ class PasswordVault: ObservableObject {
         state = .unlocked
     }
 
+    /// Re-encrypt the vault under a new master password. Requires the
+    /// vault to be unlocked; the current password is verified to prove
+    /// the caller knows it, not just that the panel is open.
+    func changeMasterPassword(current: String, new: String) throws {
+        guard state == .unlocked, let salt else { throw VaultError.corrupted }
+        guard Self.deriveKey(password: current, salt: salt) == self.key
+        else { throw VaultError.badPassword }
+
+        var saltBytes = [UInt8](repeating: 0, count: Self.saltLength)
+        let rc = SecRandomCopyBytes(kSecRandomDefault, saltBytes.count, &saltBytes)
+        guard rc == errSecSuccess else { throw VaultError.corrupted }
+        self.salt = Data(saltBytes)
+        self.key = Self.deriveKey(password: new, salt: self.salt!)
+        try save()
+    }
+
     func lock() {
         key = nil
         salt = nil

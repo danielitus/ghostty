@@ -125,6 +125,7 @@ private struct PasswordListView: View {
         forKey: "PasswordManagerAutoOpen")
     @State private var lockOnClose = UserDefaults.standard.bool(
         forKey: "PasswordManagerLockOnClose")
+    @State private var changingPassword = false
 
     private var filtered: [PasswordEntry] {
         guard !search.isEmpty else { return vault.entries }
@@ -260,6 +261,8 @@ private struct PasswordListView: View {
                     Toggle("Press Enter After Sending", isOn: $pressEnter)
                     Toggle("Open at Password Prompts", isOn: $autoOpen)
                     Toggle("Lock When Window Closes", isOn: $lockOnClose)
+                    Divider()
+                    Button("Change Master Password…") { changingPassword = true }
                 } label: {
                     Image(systemName: "gearshape")
                 }
@@ -294,6 +297,9 @@ private struct PasswordListView: View {
         .sheet(item: $editing) { entry in
             PasswordEntryEditView(vault: vault, entry: entry)
         }
+        .sheet(isPresented: $changingPassword) {
+            ChangeMasterPasswordView(vault: vault)
+        }
     }
 
     private func selectFirstIfNeeded() {
@@ -310,6 +316,60 @@ private struct PasswordListView: View {
         })
         guard !clean.isEmpty else { return }
         onSend(pressEnter ? clean + "\r" : clean)
+    }
+}
+
+// MARK: - Change master password sheet
+
+private struct ChangeMasterPasswordView: View {
+    @ObservedObject var vault: PasswordVault
+    @State private var current = ""
+    @State private var newPassword = ""
+    @State private var confirm = ""
+    @State private var error: String?
+    @Environment(\.dismiss) private var dismiss
+
+    var body: some View {
+        VStack(spacing: 12) {
+            Text("Change Master Password")
+                .font(.headline)
+
+            Form {
+                SecureField("Current Password", text: $current)
+                SecureField("New Password", text: $newPassword)
+                SecureField("Confirm New Password", text: $confirm)
+                    .onSubmit(change)
+            }
+
+            if let error {
+                Text(error).font(.caption).foregroundStyle(.red)
+            }
+
+            HStack {
+                Button("Cancel") { dismiss() }
+                    .keyboardShortcut(.cancelAction)
+                Spacer()
+                Button("Change", action: change)
+                    .keyboardShortcut(.defaultAction)
+                    .disabled(current.isEmpty || newPassword.isEmpty)
+            }
+        }
+        .padding(16)
+        .frame(width: 320)
+    }
+
+    private func change() {
+        guard newPassword == confirm else {
+            error = "New passwords do not match."
+            return
+        }
+        do {
+            try vault.changeMasterPassword(current: current, new: newPassword)
+            dismiss()
+        } catch {
+            self.error = error.localizedDescription
+            current = ""
+        }
     }
 }
 
