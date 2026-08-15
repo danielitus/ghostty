@@ -123,6 +123,8 @@ private struct PasswordListView: View {
         forKey: "PasswordManagerPressEnter")
     @State private var autoOpen = UserDefaults.standard.bool(
         forKey: "PasswordManagerAutoOpen")
+    @State private var lockOnClose = UserDefaults.standard.bool(
+        forKey: "PasswordManagerLockOnClose")
 
     private var filtered: [PasswordEntry] {
         guard !search.isEmpty else { return vault.entries }
@@ -138,86 +140,164 @@ private struct PasswordListView: View {
 
     var body: some View {
         VStack(spacing: 0) {
-            TextField("Search", text: $search)
-                .textFieldStyle(.roundedBorder)
-                .padding(8)
-
-            List(selection: $selection) {
-                ForEach(filtered) { entry in
-                    VStack(alignment: .leading, spacing: 1) {
-                        Text(entry.label)
-                        if !entry.username.isEmpty {
-                            Text(entry.username)
-                                .font(.caption)
-                                .foregroundStyle(.secondary)
-                        }
+            HStack(spacing: 6) {
+                Image(systemName: "magnifyingglass")
+                    .foregroundStyle(.secondary)
+                TextField("Search", text: $search)
+                    .textFieldStyle(.plain)
+                if !search.isEmpty {
+                    Button {
+                        search = ""
+                    } label: {
+                        Image(systemName: "xmark.circle.fill")
+                            .foregroundStyle(.secondary)
                     }
-                    .tag(entry.id)
-                    .contextMenu {
-                        Button("Edit…") { editing = entry }
-                        Button("Delete", role: .destructive) {
-                            try? vault.delete(entry)
+                    .buttonStyle(.borderless)
+                }
+            }
+            .padding(6)
+            .background(.quaternary.opacity(0.5), in: RoundedRectangle(cornerRadius: 6))
+            .padding(10)
+
+            if filtered.isEmpty {
+                VStack(spacing: 8) {
+                    Image(systemName: search.isEmpty ? "key.slash" : "magnifyingglass")
+                        .font(.system(size: 28))
+                        .foregroundStyle(.tertiary)
+                    Text(search.isEmpty ? "No Passwords" : "No Results")
+                        .font(.headline)
+                        .foregroundStyle(.secondary)
+                    if search.isEmpty {
+                        Text("Click + below to add your first entry.")
+                            .font(.caption)
+                            .foregroundStyle(.tertiary)
+                    }
+                }
+                .frame(maxWidth: .infinity, maxHeight: .infinity)
+            } else {
+                List(selection: $selection) {
+                    ForEach(filtered) { entry in
+                        HStack(spacing: 8) {
+                            Image(systemName: "key.fill")
+                                .foregroundStyle(.secondary)
+                                .frame(width: 20, height: 20)
+                                .background(.quaternary.opacity(0.6), in: Circle())
+                            VStack(alignment: .leading, spacing: 1) {
+                                Text(entry.label)
+                                if !entry.username.isEmpty {
+                                    Text(entry.username)
+                                        .font(.caption)
+                                        .foregroundStyle(.secondary)
+                                }
+                            }
+                        }
+                        .padding(.vertical, 2)
+                        .contentShape(Rectangle())
+                        .simultaneousGesture(TapGesture(count: 2).onEnded {
+                            selection = entry.id
+                            send(entry.password)
+                        })
+                        .tag(entry.id)
+                        .contextMenu {
+                            Button("Send Password") { send(entry.password) }
+                            Button("Send Username") { send(entry.username) }
+                                .disabled(entry.username.isEmpty)
+                            Divider()
+                            Button("Edit…") { editing = entry }
+                            Button("Delete", role: .destructive) {
+                                try? vault.delete(entry)
+                            }
                         }
                     }
                 }
+                .listStyle(.inset)
             }
-            .frame(minHeight: 180)
 
             Divider()
 
-            VStack(spacing: 8) {
-                HStack {
-                    Button("Send Username") { send(selected?.username) }
-                        .disabled(selected?.username.isEmpty ?? true)
-                    Button("Send Password") { send(selected?.password) }
-                        .disabled(selected == nil)
-                        .keyboardShortcut(.defaultAction)
-                }
-
-                VStack(alignment: .leading, spacing: 2) {
-                    Toggle("Press Enter after sending", isOn: $pressEnter)
-                        .onChange(of: pressEnter) { v in
-                            UserDefaults.standard.set(v, forKey: "PasswordManagerPressEnter")
-                        }
-                    Toggle("Open automatically at password prompts", isOn: $autoOpen)
-                        .onChange(of: autoOpen) { v in
-                            UserDefaults.standard.set(v, forKey: "PasswordManagerAutoOpen")
-                        }
-                }
-                .toggleStyle(.checkbox)
-                .font(.caption)
-                .frame(maxWidth: .infinity, alignment: .leading)
-
-                HStack {
-                    Button {
-                        editing = PasswordEntry(label: "", username: "", password: "")
-                    } label: {
-                        Image(systemName: "plus")
-                    }
-                    Button {
-                        if let selected { editing = selected }
-                    } label: {
-                        Image(systemName: "pencil")
-                    }
+            HStack(spacing: 8) {
+                Button("Send Username") { send(selected?.username) }
+                    .disabled(selected?.username.isEmpty ?? true)
+                Button("Send Password") { send(selected?.password) }
+                    .buttonStyle(.borderedProminent)
                     .disabled(selected == nil)
-                    Button {
-                        if let selected { try? vault.delete(selected) }
-                    } label: {
-                        Image(systemName: "minus")
-                    }
-                    .disabled(selected == nil)
-
-                    Spacer()
-
-                    Button("Lock") { vault.lock() }
-                }
+                    .keyboardShortcut(.defaultAction)
             }
+            .controlSize(.large)
+            .frame(maxWidth: .infinity)
+            .padding(.vertical, 10)
+
+            Divider()
+
+            HStack(spacing: 2) {
+                Button {
+                    editing = PasswordEntry(label: "", username: "", password: "")
+                } label: {
+                    Image(systemName: "plus")
+                        .frame(width: 20, height: 20)
+                }
+                .help("Add entry")
+                Button {
+                    if let selected { editing = selected }
+                } label: {
+                    Image(systemName: "pencil")
+                        .frame(width: 20, height: 20)
+                }
+                .disabled(selected == nil)
+                .help("Edit entry")
+                Button {
+                    if let selected { try? vault.delete(selected) }
+                } label: {
+                    Image(systemName: "minus")
+                        .frame(width: 20, height: 20)
+                }
+                .disabled(selected == nil)
+                .help("Delete entry")
+
+                Spacer()
+
+                Menu {
+                    Toggle("Press Enter After Sending", isOn: $pressEnter)
+                    Toggle("Open at Password Prompts", isOn: $autoOpen)
+                    Toggle("Lock When Window Closes", isOn: $lockOnClose)
+                } label: {
+                    Image(systemName: "gearshape")
+                }
+                .menuStyle(.borderlessButton)
+                .menuIndicator(.hidden)
+                .fixedSize()
+                .help("Options")
+
+                Button {
+                    vault.lock()
+                } label: {
+                    Image(systemName: "lock.fill")
+                        .frame(width: 20, height: 20)
+                }
+                .help("Lock vault")
+            }
+            .buttonStyle(.borderless)
             .padding(8)
+            .onChange(of: pressEnter) { v in
+                UserDefaults.standard.set(v, forKey: "PasswordManagerPressEnter")
+            }
+            .onChange(of: autoOpen) { v in
+                UserDefaults.standard.set(v, forKey: "PasswordManagerAutoOpen")
+            }
+            .onChange(of: lockOnClose) { v in
+                UserDefaults.standard.set(v, forKey: "PasswordManagerLockOnClose")
+            }
         }
-        .frame(width: 340, height: 400)
+        .frame(width: 340, height: 420)
+        .onAppear { selectFirstIfNeeded() }
+        .onChange(of: search) { _ in selectFirstIfNeeded() }
         .sheet(item: $editing) { entry in
             PasswordEntryEditView(vault: vault, entry: entry)
         }
+    }
+
+    private func selectFirstIfNeeded() {
+        if selected == nil { selection = filtered.first?.id }
     }
 
     private func send(_ text: String?) {
