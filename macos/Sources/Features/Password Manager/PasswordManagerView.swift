@@ -48,7 +48,7 @@ private struct PasswordVaultCreateView: View {
 
             Button("Create Vault", action: create)
                 .keyboardShortcut(.defaultAction)
-                .disabled(password.isEmpty)
+                .disabled(password.isEmpty || vault.busy)
         }
         .padding(20)
         .frame(width: 320)
@@ -59,10 +59,14 @@ private struct PasswordVaultCreateView: View {
             error = "Passwords do not match."
             return
         }
-        do {
-            try vault.create(masterPassword: password)
-        } catch {
-            self.error = error.localizedDescription
+        Task {
+            do {
+                try await vault.create(masterPassword: password)
+            } catch is CancellationError {
+                // Vault was locked while deriving; nothing to report.
+            } catch {
+                self.error = error.localizedDescription
+            }
         }
     }
 }
@@ -93,7 +97,7 @@ private struct PasswordVaultUnlockView: View {
 
             Button("Unlock", action: unlock)
                 .keyboardShortcut(.defaultAction)
-                .disabled(password.isEmpty)
+                .disabled(password.isEmpty || vault.busy)
         }
         .padding(20)
         .frame(width: 320)
@@ -101,11 +105,15 @@ private struct PasswordVaultUnlockView: View {
     }
 
     private func unlock() {
-        do {
-            try vault.unlock(masterPassword: password)
-        } catch {
-            self.error = error.localizedDescription
-            password = ""
+        Task {
+            do {
+                try await vault.unlock(masterPassword: password)
+            } catch is CancellationError {
+                password = ""
+            } catch {
+                self.error = error.localizedDescription
+                password = ""
+            }
         }
     }
 }
@@ -351,7 +359,7 @@ private struct ChangeMasterPasswordView: View {
                 Spacer()
                 Button("Change", action: change)
                     .keyboardShortcut(.defaultAction)
-                    .disabled(current.isEmpty || newPassword.isEmpty)
+                    .disabled(current.isEmpty || newPassword.isEmpty || vault.busy)
             }
         }
         .padding(16)
@@ -363,12 +371,16 @@ private struct ChangeMasterPasswordView: View {
             error = "New passwords do not match."
             return
         }
-        do {
-            try vault.changeMasterPassword(current: current, new: newPassword)
-            dismiss()
-        } catch {
-            self.error = error.localizedDescription
-            current = ""
+        Task {
+            do {
+                try await vault.changeMasterPassword(current: current, new: newPassword)
+                dismiss()
+            } catch is CancellationError {
+                dismiss()
+            } catch {
+                self.error = error.localizedDescription
+                current = ""
+            }
         }
     }
 }

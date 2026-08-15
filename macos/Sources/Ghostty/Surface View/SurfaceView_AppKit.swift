@@ -145,7 +145,7 @@ extension Ghostty {
                 // detected on the focused surface (opt-in via its toggle).
                 if focused || !passwordInput {
                     PasswordManagerController.shared.passwordPromptDetected(
-                        on: self, active: passwordInput)
+                        active: passwordInput)
                 }
             }
         }

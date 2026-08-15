@@ -47,9 +47,9 @@ class PasswordManagerController: NSWindowController, NSWindowDelegate {
         window.makeKeyAndOrderFront(nil)
     }
 
-    /// Called when a password prompt is detected on a surface. Opens the
-    /// panel if the user has enabled auto-open.
-    func passwordPromptDetected(on surface: Ghostty.SurfaceView, active: Bool) {
+    /// Called when a password prompt appears (active) or goes away on the
+    /// focused surface. Opens the panel if the user has enabled auto-open.
+    func passwordPromptDetected(active: Bool) {
         guard UserDefaults.standard.bool(forKey: "PasswordManagerAutoOpen") else { return }
 
         if active {
