@@ -1,3 +1,4 @@
+import AppKit
 import Foundation
 import CryptoKit
 import CommonCrypto
@@ -11,9 +12,13 @@ struct PasswordEntry: Codable, Identifiable, Equatable {
 
 /// An encrypted, file-backed store of password entries.
 ///
-/// File format: magic (8 bytes) || version (1 byte) || salt (16 bytes) ||
-/// AES-GCM combined sealed box of the JSON-encoded entries. The key is
-/// derived from a user-supplied master password via PBKDF2-HMAC-SHA256.
+/// File format v2: magic (8 bytes) || version (1 byte) || KDF ID (1 byte) ||
+/// KDF iterations (4 bytes, big-endian) || salt (16 bytes) || AES-GCM
+/// combined sealed box of the JSON-encoded entries. The key is derived from
+/// a user-supplied master password. Version 1 files (no KDF ID/iterations,
+/// fixed at 210k PBKDF2 iterations) can still be read; any save rewrites
+/// them as v2, and the iteration count itself is only raised on a master
+/// password change (raising it requires re-deriving the key).
 class PasswordVault: ObservableObject {
     static let shared = PasswordVault()
 
@@ -26,11 +31,17 @@ class PasswordVault: ObservableObject {
     enum VaultError: LocalizedError {
         case badPassword
         case corrupted
+        case locked
+        case weakPassword
 
         var errorDescription: String? {
             switch self {
             case .badPassword: return "Incorrect master password."
             case .corrupted: return "The vault file is corrupted or unreadable."
+            case .locked: return "The vault is locked."
+            case .weakPassword:
+                return "The master password must be at least " +
+                    "\(PasswordVault.minMasterPasswordLength) characters."
             }
         }
     }
@@ -41,10 +52,19 @@ class PasswordVault: ObservableObject {
     private var key: SymmetricKey?
     private var salt: Data?
 
+    /// The PBKDF2 iteration count of the currently unlocked vault. New
+    /// vaults use `defaultPBKDF2Iterations`; v1 vaults keep their legacy
+    /// count until the master password is changed.
+    private var iterations: UInt32 = PasswordVault.defaultPBKDF2Iterations
+
+    static let minMasterPasswordLength = 8
+
     private static let magic = Data("GHSTYPWV".utf8)
-    private static let version: UInt8 = 1
+    private static let version: UInt8 = 2
+    private static let kdfPBKDF2HmacSHA256: UInt8 = 1
     private static let saltLength = 16
-    private static let pbkdf2Iterations: UInt32 = 210_000
+    private static let defaultPBKDF2Iterations: UInt32 = 600_000
+    private static let v1PBKDF2Iterations: UInt32 = 210_000
 
     private static var fileURL: URL {
         let dir = FileManager.default.urls(
@@ -58,16 +78,34 @@ class PasswordVault: ObservableObject {
     private init() {
         state = FileManager.default.fileExists(atPath: Self.fileURL.path)
             ? .locked : .uninitialized
+
+        // Lock whenever the machine sleeps or the screen locks; an unlocked
+        // vault should never outlive the user's physical presence.
+        NSWorkspace.shared.notificationCenter.addObserver(
+            self, selector: #selector(lockFromNotification),
+            name: NSWorkspace.willSleepNotification, object: nil)
+        DistributedNotificationCenter.default().addObserver(
+            self, selector: #selector(lockFromNotification),
+            name: NSNotification.Name("com.apple.screenIsLocked"), object: nil)
+    }
+
+    @objc private func lockFromNotification(_ notification: Notification) {
+        lock()
     }
 
     // MARK: - Locking
 
     func create(masterPassword: String) throws {
+        guard masterPassword.count >= Self.minMasterPasswordLength
+        else { throw VaultError.weakPassword }
+
         var saltBytes = [UInt8](repeating: 0, count: Self.saltLength)
         let rc = SecRandomCopyBytes(kSecRandomDefault, saltBytes.count, &saltBytes)
         guard rc == errSecSuccess else { throw VaultError.corrupted }
         self.salt = Data(saltBytes)
-        self.key = Self.deriveKey(password: masterPassword, salt: self.salt!)
+        self.iterations = Self.defaultPBKDF2Iterations
+        self.key = try Self.deriveKey(
+            password: masterPassword, salt: self.salt!, iterations: self.iterations)
         self.entries = []
         try save()
         state = .unlocked
@@ -75,15 +113,39 @@ class PasswordVault: ObservableObject {
 
     func unlock(masterPassword: String) throws {
         let data = try Data(contentsOf: Self.fileURL)
-        let headerLen = Self.magic.count + 1 + Self.saltLength
-        guard data.count > headerLen,
-              data.prefix(Self.magic.count) == Self.magic,
-              data[Self.magic.count] == Self.version
+        guard data.count > Self.magic.count + 1,
+              data.prefix(Self.magic.count) == Self.magic
         else { throw VaultError.corrupted }
 
-        let salt = data.subdata(in: (Self.magic.count + 1)..<headerLen)
-        let key = Self.deriveKey(password: masterPassword, salt: salt)
-        let boxData = data.subdata(in: headerLen..<data.count)
+        var offset = Self.magic.count
+        let version = data[offset]
+        offset += 1
+
+        let iterations: UInt32
+        switch version {
+        case 1:
+            iterations = Self.v1PBKDF2Iterations
+        case 2:
+            guard data.count > offset + 5,
+                  data[offset] == Self.kdfPBKDF2HmacSHA256
+            else { throw VaultError.corrupted }
+            offset += 1
+            iterations = data[offset..<(offset + 4)].reduce(0) { ($0 << 8) | UInt32($1) }
+            offset += 4
+            // Reject absurd counts so a tampered header can't stall the app.
+            guard (1_000...100_000_000).contains(iterations)
+            else { throw VaultError.corrupted }
+        default:
+            throw VaultError.corrupted
+        }
+
+        guard data.count > offset + Self.saltLength else { throw VaultError.corrupted }
+        let salt = data.subdata(in: offset..<(offset + Self.saltLength))
+        offset += Self.saltLength
+
+        let key = try Self.deriveKey(
+            password: masterPassword, salt: salt, iterations: iterations)
+        let boxData = data.subdata(in: offset..<data.count)
 
         let plaintext: Data
         do {
@@ -98,6 +160,7 @@ class PasswordVault: ObservableObject {
 
         self.salt = salt
         self.key = key
+        self.iterations = iterations
         self.entries = decoded
         state = .unlocked
     }
@@ -106,16 +169,35 @@ class PasswordVault: ObservableObject {
     /// vault to be unlocked; the current password is verified to prove
     /// the caller knows it, not just that the panel is open.
     func changeMasterPassword(current: String, new: String) throws {
-        guard state == .unlocked, let salt else { throw VaultError.corrupted }
-        guard Self.deriveKey(password: current, salt: salt) == self.key
+        guard state == .unlocked, let salt, let key else { throw VaultError.locked }
+        guard try Self.deriveKey(
+            password: current, salt: salt, iterations: iterations) == key
         else { throw VaultError.badPassword }
+        guard new.count >= Self.minMasterPasswordLength
+        else { throw VaultError.weakPassword }
 
         var saltBytes = [UInt8](repeating: 0, count: Self.saltLength)
         let rc = SecRandomCopyBytes(kSecRandomDefault, saltBytes.count, &saltBytes)
         guard rc == errSecSuccess else { throw VaultError.corrupted }
-        self.salt = Data(saltBytes)
-        self.key = Self.deriveKey(password: new, salt: self.salt!)
-        try save()
+        let newSalt = Data(saltBytes)
+        let newKey = try Self.deriveKey(
+            password: new, salt: newSalt, iterations: Self.defaultPBKDF2Iterations)
+
+        // Commit to memory only once the file write succeeds; otherwise a
+        // failed save would leave memory and disk expecting different
+        // passwords.
+        let (oldSalt, oldKey, oldIterations) = (self.salt, self.key, self.iterations)
+        self.salt = newSalt
+        self.key = newKey
+        self.iterations = Self.defaultPBKDF2Iterations
+        do {
+            try save()
+        } catch {
+            self.salt = oldSalt
+            self.key = oldKey
+            self.iterations = oldIterations
+            throw error
+        }
     }
 
     func lock() {
@@ -146,7 +228,7 @@ class PasswordVault: ObservableObject {
     // MARK: - Persistence
 
     private func save() throws {
-        guard let key, let salt else { return }
+        guard let key, let salt else { throw VaultError.locked }
         let plaintext = try JSONEncoder().encode(entries)
         let box = try AES.GCM.seal(plaintext, using: key)
         guard let combined = box.combined else { throw VaultError.corrupted }
@@ -154,6 +236,8 @@ class PasswordVault: ObservableObject {
         var data = Data()
         data.append(Self.magic)
         data.append(Self.version)
+        data.append(Self.kdfPBKDF2HmacSHA256)
+        withUnsafeBytes(of: iterations.bigEndian) { data.append(contentsOf: $0) }
         data.append(salt)
         data.append(combined)
         try data.write(to: Self.fileURL, options: [.atomic, .completeFileProtection])
@@ -164,20 +248,26 @@ class PasswordVault: ObservableObject {
             ofItemAtPath: Self.fileURL.path)
     }
 
-    private static func deriveKey(password: String, salt: Data) -> SymmetricKey {
+    private static func deriveKey(
+        password: String,
+        salt: Data,
+        iterations: UInt32
+    ) throws -> SymmetricKey {
         let passwordData = Data(password.utf8)
         var derived = [UInt8](repeating: 0, count: 32)
-        passwordData.withUnsafeBytes { pwBytes in
+        let status = passwordData.withUnsafeBytes { pwBytes in
             salt.withUnsafeBytes { saltBytes in
-                _ = CCKeyDerivationPBKDF(
+                CCKeyDerivationPBKDF(
                     CCPBKDFAlgorithm(kCCPBKDF2),
                     pwBytes.bindMemory(to: Int8.self).baseAddress, passwordData.count,
                     saltBytes.bindMemory(to: UInt8.self).baseAddress, salt.count,
                     CCPseudoRandomAlgorithm(kCCPRFHmacAlgSHA256),
-                    pbkdf2Iterations,
+                    iterations,
                     &derived, derived.count)
             }
         }
+        // Never proceed with an all-zero key if derivation failed.
+        guard status == kCCSuccess else { throw VaultError.corrupted }
         return SymmetricKey(data: Data(derived))
     }
 }
