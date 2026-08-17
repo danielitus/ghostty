@@ -1,0 +1,41 @@
+name: Build Fork macOS App
+
+# Fork-only workflow: builds an unsigned ReleaseLocal Ghostty.app on a
+# GitHub-hosted macOS runner and uploads it as an artifact. Upstream's
+# release workflows use ghostty-org's private runners and signing
+# secrets, which are unavailable on forks.
+on:
+  workflow_dispatch:
+  push:
+    branches: [password-manager]
+
+jobs:
+  build-macos-app:
+    runs-on: macos-26
+    timeout-minutes: 90
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Install Zig
+        # Reads minimum_zig_version from build.zig.zon.
+        uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29 # v2.2.1
+
+      - name: Select Xcode
+        run: |
+          sudo xcode-select -s "$(ls -d /Applications/Xcode_26*.app | sort -V | tail -1)"
+          xcodebuild -version
+
+      - name: Build Ghostty.app
+        run: zig build -Doptimize=ReleaseFast
+
+      - name: Zip app bundle
+        # ditto preserves symlinks and permissions inside the .app;
+        # upload-artifact's own zip step would break them.
+        run: ditto -c -k --sequesterRsrc --keepParent macos/build/ReleaseLocal/Ghostty.app ghostty-macos.zip
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ghostty-macos
+          path: ghostty-macos.zip
