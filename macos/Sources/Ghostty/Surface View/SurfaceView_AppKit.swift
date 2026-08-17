@@ -1219,7 +1219,7 @@ extension Ghostty {
                         continue
                     }
 
-                    _ = committedPreeditTextAction(action, text: text)
+                    _ = committedTextAction(action, text: text)
                 }
 
                 if shouldReplayCommittedPreeditKey(translationEvent) {
@@ -1519,7 +1519,7 @@ extension Ghostty {
             }
         }
 
-        private func committedPreeditTextAction(
+        private func committedTextAction(
             _ action: ghostty_input_action_e,
             text: String
         ) -> Bool {
@@ -2081,7 +2081,6 @@ extension Ghostty.SurfaceView: NSTextInputClient {
     func insertText(_ string: Any, replacementRange: NSRange) {
         // We must have an associated event
         guard NSApp.currentEvent != nil else { return }
-        guard let surfaceModel else { return }
 
         // We want the string view of the any value
         var chars = ""
@@ -2107,8 +2106,6 @@ extension Ghostty.SurfaceView: NSTextInputClient {
             return
         }
 
-        let hadMarkedText = hasMarkedText()
-
         // If insertText is called, our preedit must be over.
         unmarkText()
 
@@ -2120,14 +2117,11 @@ extension Ghostty.SurfaceView: NSTextInputClient {
             return
         }
 
-        if hadMarkedText, !chars.isEmpty {
-            // Send preedit commits as key events instead of raw text for
-            // keybind interpretation by programs.
-            _ = committedPreeditTextAction(GHOSTTY_ACTION_PRESS, text: chars)
-            return
+        // All committed text (IME, dictation, etc.) must be sent as key
+        // events so programs treat it as typed input, never as a paste.
+        if !chars.isEmpty {
+            _ = committedTextAction(GHOSTTY_ACTION_PRESS, text: chars)
         }
-
-        surfaceModel.sendText(chars)
     }
 
     /// This function needs to exist for two reasons:
