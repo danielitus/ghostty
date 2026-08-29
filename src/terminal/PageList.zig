@@ -12,6 +12,7 @@ const fastmem = @import("../fastmem.zig");
 const simd = @import("../simd/main.zig");
 const tripwire = @import("../tripwire.zig");
 const DoublyLinkedList = @import("../datastruct/main.zig").IntrusiveDoublyLinkedList;
+const WasmPagePool = @import("../datastruct/main.zig").WasmPagePool;
 const color = @import("color.zig");
 const compression = @import("compress.zig");
 const highlight = @import("highlight.zig");
@@ -306,13 +307,24 @@ const std_capacity = pagepkg.std_capacity;
 /// The byte size required for a standard page.
 const std_size = Page.layout(std_capacity).total_size;
 
+/// True when the page pool is the wasm page pool, which recycles items
+/// through a free list shared by the whole module instance instead of
+/// dying with the pool.
+///
+/// Test builds use the std pool even on wasm so that pool memory goes
+/// through the testing allocator and participates in leak detection.
+const wasm_page_pool = builtin.target.cpu.arch.isWasm() and !builtin.is_test;
+
 /// The memory pool we use for page memory buffers. We use a separate pool
 /// so we can allocate these with a page allocator. We have to use a page
 /// allocator because we need memory that is zero-initialized and page-aligned.
-const PagePool = std.heap.memory_pool.AlignedManaged(
-    [std_size]u8,
-    .fromByteUnits(std.heap.page_size_min),
-);
+const PagePool = if (wasm_page_pool)
+    WasmPagePool([std_size]u8)
+else
+    std.heap.memory_pool.AlignedManaged(
+        [std_size]u8,
+        .fromByteUnits(std.heap.page_size_min),
+    );
 
 /// List of pins, known as "tracked" pins. These are pins that are kept
 /// up to date automatically through page-modifying operations.
@@ -677,13 +689,13 @@ fn initPages(
     // redundant here for safety.
     assert(layout.total_size <= size.max_page_size);
 
-    // If we have an error, we need to clean up our heap-owned pages
-    // since they're not in the pool.
+    // If we have an error, we need to clean up our pages: heap-owned
+    // pages are freed directly and pool-owned pages are reclaimed.
     errdefer {
         var it = page_list.first;
         while (it) |node| : (it = node.next) {
             switch (node.owned) {
-                .pool => {},
+                .pool => reclaimPoolPage(pool, node.page()),
                 .heap => page_alloc.free(node.page().memory),
             }
         }
@@ -876,6 +888,20 @@ fn verifyIntegrity(self: *const PageList) IntegrityError!void {
     }
 }
 
+/// Return a pool-owned page buffer to the page pool during a teardown
+/// walk, zeroed for reuse (mirroring destroyNodeExt). Teardown walks
+/// call this unconditionally for every pool-owned page.
+fn reclaimPoolPage(pool: *MemoryPool, page: *const Page) void {
+    // Only wasm requires this
+    if (comptime !wasm_page_pool) return;
+
+    const item: *align(std.heap.page_size_min) [std_size]u8 =
+        @ptrCast(@alignCast(page.memory.ptr));
+    // We have to zero the item
+    _ = terminal_mem.decommit(.zero, item, page.memory.len);
+    pool.pages.destroy(item);
+}
+
 /// Deinit the pagelist, freeing all page memory and the memory pool.
 pub fn deinit(self: *PageList) void {
     // Verify integrity before cleanup
@@ -884,14 +910,14 @@ pub fn deinit(self: *PageList) void {
     // Always deallocate our hashmap.
     self.tracked_pins.deinit(self.pool.alloc);
 
-    // Go through our linked list and deallocate all pages that are
-    // heap-owned (not in the pool).
+    // Go through our linked list and release every page: heap-owned
+    // pages are freed directly and pool-owned pages are reclaimed.
     const page_alloc = self.pool.pages.allocator;
     var it = self.pages.first;
     while (it) |node| : (it = node.next) {
         const page = node.restore(.discard);
         switch (node.owned) {
-            .pool => {},
+            .pool => reclaimPoolPage(&self.pool, page),
             .heap => page_alloc.free(page.memory),
         }
     }
@@ -933,15 +959,16 @@ pub fn reset(self: *PageList) void {
         cap.rows,
     ) catch unreachable;
 
-    // Before resetting our pools we need to free any pages that
-    // are heap-owned since those were allocated outside the pool.
+    // Before resetting our pools we need to release our pages:
+    // heap-owned pages are freed since they were allocated outside
+    // the pool, and pool-owned pages are reclaimed.
     {
         const page_alloc = self.pool.pages.allocator;
         var it = self.pages.first;
         while (it) |node| : (it = node.next) {
             const page = node.restore(.discard);
             switch (node.owned) {
-                .pool => {},
+                .pool => reclaimPoolPage(&self.pool, page),
                 .heap => page_alloc.free(page.memory),
             }
         }
@@ -962,46 +989,51 @@ pub fn reset(self: *PageList) void {
     // retaining a certain amount of memory, it won't use mmap and won't
     // be zeroed. This block zeroes out all the memory in the pool arena.
     //
+    // The wasm page pool has no arena to scrub: its free-list items were
+    // zeroed by reclaimPoolPage above.
+    //
     // Note: we only have to do this for the page pool because the nodes are
     // always fully overwritten on each allocation.
-    inline for (.{
-        self.pool.pages.unmanaged.arena_state.used_list,
-        self.pool.pages.unmanaged.arena_state.free_list,
-    }) |first| {
-        var node_ = first;
-        while (node_) |node| : (node_ = node.next) {
-            // NOTE: Zig 0.16.0's arenas don't use the linked list types
-            // anymore, so we can just reference fields directly. The node
-            // type is still private though, so we have to parse out some
-            // of the internal methods to work with the buffer - namely
-            // Node.loadBuf and Node.Size.toInt. They are combined below.
-            //
-            // PS: My (vancluever's) reading of the code gives me the
-            // impression that we no longer need to offset the data by the
-            // header, because there's no linked list overhead anymore. But
-            // I'm sure we'll see pretty quick when I run the tests. :)
-            //
-            const BufNode = struct {
-                size: Size,
-                end_index: usize,
-                next: ?*@This(),
+    if (comptime !wasm_page_pool) {
+        inline for (.{
+            self.pool.pages.unmanaged.arena_state.used_list,
+            self.pool.pages.unmanaged.arena_state.free_list,
+        }) |first| {
+            var node_ = first;
+            while (node_) |node| : (node_ = node.next) {
+                // NOTE: Zig 0.16.0's arenas don't use the linked list types
+                // anymore, so we can just reference fields directly. The node
+                // type is still private though, so we have to parse out some
+                // of the internal methods to work with the buffer - namely
+                // Node.loadBuf and Node.Size.toInt. They are combined below.
+                //
+                // PS: My (vancluever's) reading of the code gives me the
+                // impression that we no longer need to offset the data by the
+                // header, because there's no linked list overhead anymore. But
+                // I'm sure we'll see pretty quick when I run the tests. :)
+                //
+                const BufNode = struct {
+                    size: Size,
+                    end_index: usize,
+                    next: ?*@This(),
 
-                const Size = packed struct(usize) {
-                    resizing: bool,
-                    _: @Int(.unsigned, @bitSizeOf(usize) - 1) = 0,
+                    const Size = packed struct(usize) {
+                        resizing: bool,
+                        _: @Int(.unsigned, @bitSizeOf(usize) - 1) = 0,
 
-                    fn toInt(s: Size) usize {
-                        var int = s;
-                        int.resizing = false;
-                        return @bitCast(int);
-                    }
+                        fn toInt(s: Size) usize {
+                            var int = s;
+                            int.resizing = false;
+                            return @bitCast(int);
+                        }
+                    };
                 };
-            };
 
-            const buf_node_ptr: *BufNode = @ptrCast(node);
-            const buf_node_size = @atomicLoad(BufNode.Size, &buf_node_ptr.size, .monotonic);
-            const buf = @as([*]u8, @ptrCast(node))[0..buf_node_size.toInt()][@sizeOf(BufNode)..];
-            @memset(buf, 0);
+                const buf_node_ptr: *BufNode = @ptrCast(node);
+                const buf_node_size = @atomicLoad(BufNode.Size, &buf_node_ptr.size, .monotonic);
+                const buf = @as([*]u8, @ptrCast(node))[0..buf_node_size.toInt()][@sizeOf(BufNode)..];
+                @memset(buf, 0);
+            }
         }
     }
 
@@ -1104,7 +1136,7 @@ pub fn clone(
         var page_it = page_list.first;
         while (page_it) |node| : (page_it = node.next) {
             switch (node.owned) {
-                .pool => {},
+                .pool => reclaimPoolPage(&pool, node.page()),
                 .heap => page_alloc.free(node.page().memory),
             }
         }
@@ -2535,8 +2567,9 @@ const ReflowCursor = struct {
             }
         }
 
-        // Clear the row from the old page and truncate it.
-        old_page.clearCells(old_row, 0, old_page.size.cols);
+        // Reset the row on the old page and truncate it. The retired
+        // storage must be left in the default state (see resetRow).
+        old_page.resetRow(old_row);
         old_page.size.rows -= 1;
 
         // If that was the last row in that page
@@ -3026,11 +3059,7 @@ fn resizeWithoutReflowGrowCols(
         const prev_page = prev.?.page();
         const prev_size = prev_page.size.rows - prev_copied;
         const prev_rows = prev_page.rows.ptr(prev_page.memory)[prev_size..prev_page.size.rows];
-        for (prev_rows) |*row| prev_page.clearCells(
-            row,
-            0,
-            prev_page.size.cols,
-        );
+        for (prev_rows) |*row| prev_page.resetRow(row);
         prev_page.size.rows = prev_size;
     };
 
@@ -3180,6 +3209,14 @@ fn trimTrailingBlankRows(
             self.invalidateNodeLayout(row_pin.node);
             invalidated_node = row_pin.node;
         }
+
+        // The row has no text but can still carry metadata (e.g. a
+        // blank prompt continuation line) and background-colored
+        // cells. The retired storage is re-exposed by the grow()
+        // fast path without any clearing, so it must be left in the
+        // default state.
+        row_pin.node.page().resetRow(row_pin.rowAndCell().row);
+
         row_pin.node.page().size.rows -= 1;
         if (row_pin.node.page().size.rows == 0) {
             self.erasePage(row_pin.node);
@@ -3732,13 +3769,11 @@ pub fn split(
         // p.x remains the same since we're copying the row as-is
     }
 
-    // Clear our rows
+    // Reset our rows. They are retired into unused page capacity,
+    // which the grow() fast path re-exposes without any clearing, so
+    // they must be left in the default state.
     for (page.rows.ptr(page.memory)[y_start..y_end]) |*row| {
-        page.clearCells(
-            row,
-            0,
-            page.size.cols,
-        );
+        page.resetRow(row);
     }
     page.size.rows -= y_end - y_start;
 
@@ -3945,7 +3980,12 @@ pub fn grow(self: *PageList) Allocator.Error!?*List.Node {
 
     const last = self.pages.last.?;
     if (last.capacity().rows > last.rows()) {
-        // Fast path: we have capacity in the last page.
+        // Fast path: we have capacity in the last page. The exposed
+        // row requires no clearing work here: rows in unused page
+        // capacity are always in the default zero state, either
+        // because the page memory was never used (pool buffers are
+        // zeroed) or because whatever retired the row reset it (see
+        // Page.resetRow).
         const page = last.page();
         page.size.rows += 1;
         page.assertIntegrity();
@@ -5175,8 +5215,10 @@ pub fn eraseRow(
         }
     }
 
-    // Clear the final row which was rotated from the top of the page.
-    page.clearCells(&rows[node.rows() - 1], 0, node.cols());
+    // Reset the final row which was rotated from the top of the page.
+    // A full reset (not just clearing cells) so no metadata from the
+    // erased row is retained by the new blank row.
+    page.resetRow(&rows[node.rows() - 1]);
 }
 
 /// A variant of eraseRow that shifts only a bounded number of following
@@ -5214,7 +5256,7 @@ pub fn eraseRowBounded(
     if (node.rows() - pn.y > limit) {
         // Rotating this bounded region changes its cached row coordinates.
         self.invalidateNodeLayout(node);
-        page.clearCells(&rows[pn.y], 0, node.cols());
+        page.resetRow(&rows[pn.y]);
         fastmem.rotateOnce(Row, rows[pn.y..][0 .. limit + 1]);
 
         // Mark the whole page as dirty.
@@ -5326,7 +5368,7 @@ pub fn eraseRowBounded(
         if (node.rows() > shifted_limit) {
             // Rotating this bounded prefix changes its cached row coordinates.
             self.invalidateNodeLayout(node);
-            page.clearCells(&rows[0], 0, node.cols());
+            page.resetRow(&rows[0]);
             fastmem.rotateOnce(Row, rows[0 .. shifted_limit + 1]);
 
             // Mark the whole page as dirty.
@@ -5394,9 +5436,9 @@ pub fn eraseRowBounded(
         }
     }
 
-    // We reached the end of the page list before the limit, so we clear
+    // We reached the end of the page list before the limit, so we reset
     // the final row since it was rotated down from the top of this page.
-    page.clearCells(&rows[node.rows() - 1], 0, node.cols());
+    page.resetRow(&rows[node.rows() - 1]);
 }
 
 /// Erase all history rows, optionally up to a bottom-left bound.
@@ -5489,15 +5531,12 @@ fn eraseRows(
             dst.dirty = true;
         }
 
-        // Clear our remaining cells that we didn't shift or swapped
-        // in case we grow back into them.
+        // Reset our remaining rows that we didn't shift or swapped.
+        // These are retired into unused page capacity, which the
+        // grow() fast path re-exposes without any clearing, so they
+        // must be left in the default state.
         for (scroll_amount..chunk.node.rows()) |i| {
-            const row: *Row = &rows[i];
-            page.clearCells(
-                row,
-                0,
-                chunk.node.cols(),
-            );
+            page.resetRow(&rows[i]);
         }
 
         // Update any tracked pins to shift their y. If it was in the erased
@@ -20197,5 +20236,160 @@ test "PageList split preserves hyperlinks" {
         const link_id = second_page.lookupHyperlink(rac.cell).?;
         const link = second_page.hyperlink_set.get(second_page.memory, link_id);
         try testing.expectEqualStrings("https://example.com", link.uri.slice(second_page.memory));
+    }
+}
+
+test "PageList eraseRow recycled row has default metadata" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+
+    var s = try init(alloc, .{ .cols = 5, .rows = 3 });
+    defer s.deinit();
+
+    // Simulate the top row being part of a soft-wrapped, prompt-marked
+    // line. Erasing it recycles its Row storage as the new blank
+    // bottom row, which must not retain any of this metadata.
+    {
+        const rac = s.getCell(.{ .active = .{} }).?;
+        rac.row.wrap = true;
+        rac.row.wrap_continuation = true;
+        rac.row.semantic_prompt = .prompt;
+    }
+
+    try s.eraseRow(.{ .active = .{} });
+
+    {
+        const rac = s.getCell(.{ .active = .{ .y = 2 } }).?;
+        try testing.expect(!rac.row.wrap);
+        try testing.expect(!rac.row.wrap_continuation);
+        try testing.expectEqual(.none, rac.row.semantic_prompt);
+    }
+}
+
+test "PageList eraseRowBounded recycled row has default metadata" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+
+    // A limit smaller than the remaining rows in the page exercises
+    // the bounded-rotate branch; a larger limit exercises the fallback
+    // branch that clears the final row after a full rotation.
+    for ([_]usize{ 1, 10 }) |limit| {
+        var s = try init(alloc, .{ .cols = 5, .rows = 3 });
+        defer s.deinit();
+
+        {
+            const rac = s.getCell(.{ .active = .{} }).?;
+            rac.row.wrap = true;
+            rac.row.wrap_continuation = true;
+            rac.row.semantic_prompt = .prompt;
+        }
+
+        try s.eraseRowBounded(.{ .active = .{} }, limit);
+
+        const recycled_y = @min(limit, 2);
+        const rac = s.getCell(.{ .active = .{ .y = @intCast(recycled_y) } }).?;
+        try testing.expect(!rac.row.wrap);
+        try testing.expect(!rac.row.wrap_continuation);
+        try testing.expectEqual(.none, rac.row.semantic_prompt);
+    }
+}
+
+test "PageList eraseActive regrown rows have default metadata" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+
+    var s = try init(alloc, .{ .cols = 5, .rows = 3 });
+    defer s.deinit();
+
+    // Mark the rows that will be erased. eraseActive retires their
+    // storage into unused page capacity and then regrows the active
+    // area, re-exposing the same Row storage via the grow() fast path.
+    for (0..2) |y| {
+        const rac = s.getCell(.{ .active = .{ .y = @intCast(y) } }).?;
+        rac.row.wrap = true;
+        rac.row.wrap_continuation = true;
+        rac.row.semantic_prompt = .prompt;
+    }
+
+    s.eraseActive(1);
+
+    for (0..3) |y| {
+        const rac = s.getCell(.{ .active = .{ .y = @intCast(y) } }).?;
+        try testing.expect(!rac.row.wrap);
+        try testing.expect(!rac.row.wrap_continuation);
+        try testing.expectEqual(.none, rac.row.semantic_prompt);
+    }
+}
+
+test "PageList split retired rows have default state" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+
+    var s = try init(alloc, .{ .cols = 5, .rows = 10 });
+    defer s.deinit();
+
+    // Put metadata and a background-colored (non-zero, but text-free)
+    // cell on a row that the split will move to the new page. The
+    // retired Row storage on the source page goes back into unused
+    // capacity that grow() re-exposes without clearing.
+    {
+        const rac = s.getCell(.{ .active = .{ .y = 7 } }).?;
+        rac.row.wrap = true;
+        rac.row.semantic_prompt = .prompt;
+        rac.cell.* = .{
+            .content_tag = .bg_color_palette,
+            .content = .{ .color_palette = .{ .data = 42 } },
+        };
+    }
+
+    const node = s.pages.first.?;
+    try s.split(s.pin(.{ .active = .{ .y = 5 } }).?);
+
+    // The source page was truncated to 5 rows; peek at the retired
+    // storage beyond size.rows.
+    const page = node.page();
+    try testing.expectEqual(@as(usize, 5), page.size.rows);
+    const rows = page.rows.ptr(page.memory.ptr);
+    for (5..10) |y| {
+        const row = rows[y];
+        try testing.expect(!row.wrap);
+        try testing.expect(!row.wrap_continuation);
+        try testing.expectEqual(.none, row.semantic_prompt);
+        const cells = row.cells.ptr(page.memory.ptr)[0..page.size.cols];
+        for (cells) |cell| try testing.expect(cell.isZero());
+    }
+}
+
+test "PageList resize trimmed rows have default state" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+
+    var s = try init(alloc, .{ .cols = 5, .rows = 5 });
+    defer s.deinit();
+
+    // A trailing blank row has no text, so shrinking rows trims it,
+    // but it can still carry metadata (e.g. a blank prompt
+    // continuation line) and background-colored cells. Trimming
+    // retires the storage into unused capacity that grow()
+    // re-exposes without clearing.
+    {
+        const rac = s.getCell(.{ .active = .{ .y = 4 } }).?;
+        rac.row.wrap_continuation = true;
+        rac.row.semantic_prompt = .prompt_continuation;
+        rac.cell.* = .{
+            .content_tag = .bg_color_palette,
+            .content = .{ .color_palette = .{ .data = 42 } },
+        };
+    }
+
+    try s.resize(.{ .rows = 4, .reflow = false });
+    try s.resize(.{ .rows = 5, .reflow = false });
+
+    {
+        const rac = s.getCell(.{ .active = .{ .y = 4 } }).?;
+        try testing.expect(!rac.row.wrap);
+        try testing.expect(!rac.row.wrap_continuation);
+        try testing.expectEqual(.none, rac.row.semantic_prompt);
+        try testing.expect(rac.cell.isZero());
     }
 }

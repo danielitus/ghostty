@@ -78,6 +78,7 @@ pub const focus_encode = focus.encode;
 pub const mode_report_encode = modes.report_encode;
 
 pub const formatter_terminal_new = formatter.terminal_new;
+pub const formatter_format = formatter.format;
 pub const formatter_format_buf = formatter.format_buf;
 pub const formatter_format_alloc = formatter.format_alloc;
 pub const formatter_free = formatter.free;
@@ -159,6 +160,7 @@ pub const mouse_encoder_encode = mouse_encode.encode;
 
 pub const paste_is_safe = paste.is_safe;
 pub const paste_encode = paste.encode;
+pub const terminal_paste = paste.terminal_paste;
 
 pub const alloc_alloc = allocator.alloc;
 pub const alloc_free = allocator.free;

@@ -1491,11 +1491,7 @@ extension Ghostty {
             var key_ev = event.ghosttyKeyEvent(action, translationMods: translationEvent?.modifierFlags)
             key_ev.composing = composing
 
-            // For text, we only encode UTF8 if we don't have a single control
-            // character. Control characters are encoded by Ghostty itself.
-            // Without this, `ctrl+enter` does the wrong thing.
-            if let text, text.count > 0,
-               let codepoint = text.utf8.first, codepoint >= 0x20 {
+            if let text = text?.keyEventText {
                 return text.withCString { ptr in
                     key_ev.text = ptr
                     return ghostty_surface_key(surface, key_ev)
@@ -2311,10 +2307,7 @@ extension Ghostty.SurfaceView {
 
         if let content {
             DispatchQueue.main.async {
-                self.insertText(
-                    content,
-                    replacementRange: NSRange(location: 0, length: 0)
-                )
+                self.surfaceModel?.sendText(content)
             }
             return true
         }
