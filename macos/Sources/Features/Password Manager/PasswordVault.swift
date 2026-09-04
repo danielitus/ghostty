@@ -55,7 +55,7 @@ class PasswordVault: ObservableObject {
                 return "Touch ID was canceled."
             case .keychain(let status):
                 let msg = SecCopyErrorMessageString(status, nil) as String?
-                return "Keychain error: \(msg ?? String(status))"
+                return "Touch ID setup failed: \(msg ?? String(status))"
             }
         }
     }
@@ -67,16 +67,17 @@ class PasswordVault: ObservableObject {
     /// the UI should disable submission to prevent overlapping attempts.
     @Published private(set) var busy = false
 
-    /// Whether the derived vault key is stored in the Keychain behind a
-    /// biometric (Touch ID / Watch) access control, so the vault can be
-    /// opened without typing the master password. Mirrors a UserDefaults
-    /// flag; the Keychain item itself is the source of truth and the flag
-    /// is cleared whenever the item turns out to be gone or invalidated.
+    /// Whether the derived vault key is wrapped by a Secure Enclave key
+    /// that requires Touch ID to use, so the vault can be opened without
+    /// typing the master password. Mirrors a UserDefaults flag; the
+    /// wrapped-key file is the source of truth and the flag is cleared
+    /// whenever it turns out to be gone or invalidated.
     @Published private(set) var biometricsEnabled: Bool
 
-    /// True when this Mac can evaluate a biometric policy right now.
+    /// True when this Mac can evaluate a biometric policy right now and
+    /// has a Secure Enclave to hold the wrapping key.
     var biometricsAvailable: Bool {
-        LAContext().canEvaluatePolicy(
+        SecureEnclave.isAvailable && LAContext().canEvaluatePolicy(
             .deviceOwnerAuthenticationWithBiometrics, error: nil)
     }
 
@@ -112,8 +113,6 @@ class PasswordVault: ObservableObject {
     private static let v1PBKDF2Iterations: UInt32 = 210_000
 
     private static let biometricsDefaultsKey = "PasswordManagerTouchID"
-    private static let keychainService = "com.mitchellh.ghostty.password-manager"
-    private static let keychainAccount = "vault-key"
 
     nonisolated private static var fileURL: URL {
         let dir = FileManager.default.urls(
@@ -197,12 +196,12 @@ class PasswordVault: ObservableObject {
         state = .unlocked
     }
 
-    /// Unlock using the vault key stored in the Keychain behind Touch ID.
+    /// Unlock using the Secure Enclave-wrapped vault key behind Touch ID.
     /// The system shows the biometric prompt; on cancel this throws
-    /// `VaultError.biometricsCanceled`. If the Keychain item is missing or
-    /// has been invalidated (biometric enrollment changed, app signature
-    /// changed), Touch ID is disabled and `biometricsUnavailable` thrown so
-    /// the UI falls back to the master password.
+    /// `VaultError.biometricsCanceled`. If the wrapped key is missing or
+    /// has been invalidated (biometric enrollment changed), Touch ID is
+    /// disabled and `biometricsUnavailable` thrown so the UI falls back to
+    /// the master password.
     func unlockWithBiometrics() async throws {
         guard !busy, state == .locked else { return }
         guard biometricsEnabled else { throw VaultError.biometricsUnavailable }
@@ -237,8 +236,8 @@ class PasswordVault: ObservableObject {
         state = .unlocked
     }
 
-    /// Store the current vault key in the Keychain protected by the
-    /// currently enrolled biometrics. Requires an unlocked vault, which
+    /// Wrap the current vault key with a Secure Enclave key protected by
+    /// the currently enrolled biometrics. Requires an unlocked vault, which
     /// proves the caller knew the master password.
     func enableBiometrics() throws {
         guard state == .unlocked, let key else { throw VaultError.locked }
@@ -295,10 +294,10 @@ class PasswordVault: ObservableObject {
             throw error
         }
 
-        // Keep Touch ID working across the change: the stored key is the
-        // derived key, which just changed. Writing needs no biometric
-        // prompt. If the write fails, fall back to disabled rather than
-        // leaving a stale key that can never open the vault.
+        // Keep Touch ID working across the change: the wrapped key is the
+        // derived key, which just changed. Re-wrapping needs no biometric
+        // prompt. If it fails, fall back to disabled rather than leaving a
+        // stale key that can never open the vault.
         if biometricsEnabled {
             do {
                 try Self.storeKeyInKeychain(newKey)
@@ -439,73 +438,141 @@ class PasswordVault: ObservableObject {
         return decoded
     }
 
-    // MARK: - Keychain (Touch ID)
+    // MARK: - Touch ID key wrapping
 
-    nonisolated private static var keychainBaseQuery: [String: Any] {
-        [
-            kSecClass as String: kSecClassGenericPassword,
-            kSecAttrService as String: keychainService,
-            kSecAttrAccount as String: keychainAccount,
-        ]
+    /// Touch ID is implemented with the Secure Enclave rather than the
+    /// Keychain: biometric-gated Keychain items need the data protection
+    /// keychain, which refuses ad-hoc signed builds (-34018). The Secure
+    /// Enclave itself has no such requirement.
+    ///
+    /// Enabling creates an SE P-256 key whose *use* requires the current
+    /// biometric enrollment, then wraps the vault key: an ephemeral P-256
+    /// key does ECDH with the SE public key, HKDF derives a wrapping key,
+    /// and AES-GCM seals the vault key. The SE key blob, ephemeral public
+    /// key, salt, and sealed box go into `passwords.touchid` (0600) beside
+    /// the vault. Unlocking reverses this; the ECDH on the SE side is what
+    /// triggers the Touch ID sheet. Enrollment changes invalidate the SE
+    /// key, which surfaces as a failure and disables the feature.
+    private static let touchIDMagic = Data("GHSTYTID".utf8)
+    private static let touchIDVersion: UInt8 = 1
+    private static let touchIDInfo = Data("ghostty-password-vault-touchid".utf8)
+
+    nonisolated private static var touchIDFileURL: URL {
+        fileURL.deletingLastPathComponent().appendingPathComponent("passwords.touchid")
     }
 
-    /// Writes the key as a generic-password item readable only after the
-    /// user passes biometric authentication with the *current* enrollment;
-    /// adding or removing a fingerprint invalidates the item. Adding the
-    /// item itself never prompts.
     nonisolated private static func storeKeyInKeychain(_ key: SymmetricKey) throws {
         var cfError: Unmanaged<CFError>?
         guard let access = SecAccessControlCreateWithFlags(
             nil,
             kSecAttrAccessibleWhenUnlockedThisDeviceOnly,
-            .biometryCurrentSet,
+            [.privateKeyUsage, .biometryCurrentSet],
             &cfError)
         else { throw VaultError.keychain(errSecParam) }
 
-        let keyData = key.withUnsafeBytes { Data($0) }
+        let seKey: SecureEnclave.P256.KeyAgreement.PrivateKey
+        do {
+            seKey = try SecureEnclave.P256.KeyAgreement.PrivateKey(accessControl: access)
+        } catch {
+            throw VaultError.keychain(OSStatus((error as NSError).code))
+        }
+
+        var saltBytes = [UInt8](repeating: 0, count: saltLength)
+        guard SecRandomCopyBytes(kSecRandomDefault, saltBytes.count, &saltBytes) == errSecSuccess
+        else { throw VaultError.corrupted }
+        let salt = Data(saltBytes)
+
+        let ephemeral = P256.KeyAgreement.PrivateKey()
+        let shared = try ephemeral.sharedSecretFromKeyAgreement(with: seKey.publicKey)
+        let wrapKey = shared.hkdfDerivedSymmetricKey(
+            using: SHA256.self, salt: salt, sharedInfo: touchIDInfo, outputByteCount: 32)
+        let vaultKeyData = key.withUnsafeBytes { Data($0) }
+        guard let sealed = try AES.GCM.seal(vaultKeyData, using: wrapKey).combined
+        else { throw VaultError.corrupted }
+
+        let seBlob = seKey.dataRepresentation
+        let ephPub = ephemeral.publicKey.rawRepresentation
+        var data = Data()
+        data.append(touchIDMagic)
+        data.append(touchIDVersion)
+        withUnsafeBytes(of: UInt16(seBlob.count).bigEndian) { data.append(contentsOf: $0) }
+        data.append(seBlob)
+        withUnsafeBytes(of: UInt16(ephPub.count).bigEndian) { data.append(contentsOf: $0) }
+        data.append(ephPub)
+        data.append(salt)
+        data.append(sealed)
+
+        let url = touchIDFileURL
         deleteKeyFromKeychain()
-        var query = keychainBaseQuery
-        query[kSecAttrAccessControl as String] = access
-        query[kSecValueData as String] = keyData
-        query[kSecAttrLabel as String] = "Ghostty Password Vault"
-        let status = SecItemAdd(query as CFDictionary, nil)
-        guard status == errSecSuccess else { throw VaultError.keychain(status) }
+        guard FileManager.default.createFile(
+            atPath: url.path, contents: nil,
+            attributes: [.posixPermissions: 0o600])
+        else { throw VaultError.corrupted }
+        try data.write(to: url, options: [.completeFileProtection])
     }
 
     nonisolated private static func deleteKeyFromKeychain() {
-        SecItemDelete(keychainBaseQuery as CFDictionary)
+        try? FileManager.default.removeItem(at: touchIDFileURL)
     }
 
-    /// Reads the key back; the system presents the Touch ID sheet. Runs
-    /// off the main actor since the call blocks until the user responds.
+    /// Unwraps the vault key; the Secure Enclave operation presents the
+    /// Touch ID sheet. Runs off the main actor since it blocks until the
+    /// user responds.
     @concurrent nonisolated private static func readKeyFromKeychain() async throws -> SymmetricKey {
+        guard let data = try? Data(contentsOf: touchIDFileURL)
+        else { throw VaultError.biometricsUnavailable }
+
+        // Parse; any malformation means the file is useless, not transient.
+        var offset = 0
+        func take(_ n: Int) throws -> Data {
+            guard n >= 0, data.count >= offset + n else { throw VaultError.biometricsUnavailable }
+            defer { offset += n }
+            return data.subdata(in: offset..<(offset + n))
+        }
+        func takeU16() throws -> Int {
+            let b = try take(2)
+            return Int(b[b.startIndex]) << 8 | Int(b[b.startIndex + 1])
+        }
+        guard try take(touchIDMagic.count) == touchIDMagic,
+              try take(1).first == touchIDVersion
+        else { throw VaultError.biometricsUnavailable }
+        let seBlob = try take(try takeU16())
+        let ephPub = try take(try takeU16())
+        let salt = try take(saltLength)
+        let sealedData = data.subdata(in: offset..<data.count)
+
         let context = LAContext()
         context.localizedReason = "unlock the password vault"
-        // No "Enter Password" fallback: the item is biometric-only, and the
-        // master password field is the fallback in our own UI.
+        // No "Enter Password" fallback: the master password field in our
+        // own UI is the fallback.
         context.localizedFallbackTitle = ""
 
-        var query = keychainBaseQuery
-        query[kSecReturnData as String] = true
-        query[kSecMatchLimit as String] = kSecMatchLimitOne
-        query[kSecUseAuthenticationContext as String] = context
-
-        var result: CFTypeRef?
-        let status = SecItemCopyMatching(query as CFDictionary, &result)
-        switch status {
-        case errSecSuccess:
-            guard let data = result as? Data, data.count == 32
-            else { throw VaultError.biometricsUnavailable }
-            return SymmetricKey(data: data)
-        case errSecUserCanceled, errSecAuthFailed:
-            // errSecAuthFailed is also what a "too many attempts" lockout
-            // surfaces as; treat both as "didn't authenticate this time"
-            // rather than tearing down the Touch ID setup.
-            throw VaultError.biometricsCanceled
-        case errSecItemNotFound, errSecInteractionNotAllowed:
+        do {
+            let seKey = try SecureEnclave.P256.KeyAgreement.PrivateKey(
+                dataRepresentation: seBlob, authenticationContext: context)
+            let pub = try P256.KeyAgreement.PublicKey(rawRepresentation: ephPub)
+            let shared = try seKey.sharedSecretFromKeyAgreement(with: pub)
+            let wrapKey = shared.hkdfDerivedSymmetricKey(
+                using: SHA256.self, salt: salt, sharedInfo: touchIDInfo, outputByteCount: 32)
+            let box = try AES.GCM.SealedBox(combined: sealedData)
+            let vaultKeyData = try AES.GCM.open(box, using: wrapKey)
+            guard vaultKeyData.count == 32 else { throw VaultError.biometricsUnavailable }
+            return SymmetricKey(data: vaultKeyData)
+        } catch let error as NSError where error.domain == LAErrorDomain {
+            switch LAError.Code(rawValue: error.code) {
+            case .biometryNotEnrolled, .biometryNotAvailable:
+                throw VaultError.biometricsUnavailable
+            default:
+                // Cancel, failed match, lockout, fallback: the user simply
+                // didn't authenticate this time. Keep the setup.
+                throw VaultError.biometricsCanceled
+            }
+        } catch let error as VaultError {
+            throw error
+        } catch {
+            // Anything else (SE key invalidated by an enrollment change,
+            // corrupt blob, ...) means this wrapped key can't be used.
             throw VaultError.biometricsUnavailable
-        default:
-            throw VaultError.keychain(status)
         }
     }
 
