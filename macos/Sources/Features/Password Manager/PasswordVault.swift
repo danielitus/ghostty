@@ -338,6 +338,21 @@ class PasswordVault: ObservableObject {
         try save()
     }
 
+    /// Reorder entries; the order is persisted as part of the vault.
+    func move(fromOffsets source: IndexSet, toOffset destination: Int) throws {
+        entries.move(fromOffsets: source, toOffset: destination)
+        try save()
+    }
+
+    /// Move a single entry up (`-1`) or down (`+1`) by one position.
+    func move(_ entry: PasswordEntry, by delta: Int) throws {
+        guard let idx = entries.firstIndex(where: { $0.id == entry.id }) else { return }
+        let target = idx + delta
+        guard entries.indices.contains(target) else { return }
+        entries.swapAt(idx, target)
+        try save()
+    }
+
     // MARK: - Persistence
 
     private func save() throws {

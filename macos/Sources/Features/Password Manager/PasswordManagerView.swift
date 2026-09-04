@@ -246,11 +246,23 @@ private struct PasswordListView: View {
                             Button("Send Username") { send(entry.username) }
                                 .disabled(entry.username.isEmpty)
                             Divider()
+                            Button("Move Up") { try? vault.move(entry, by: -1) }
+                                .disabled(!search.isEmpty || vault.entries.first?.id == entry.id)
+                            Button("Move Down") { try? vault.move(entry, by: 1) }
+                                .disabled(!search.isEmpty || vault.entries.last?.id == entry.id)
+                            Divider()
                             Button("Edit…") { editing = entry }
                             Button("Delete", role: .destructive) {
                                 try? vault.delete(entry)
                             }
                         }
+                    }
+                    // Drag to reorder. Only meaningful on the unfiltered
+                    // list: offsets in a filtered view don't map to the
+                    // vault, so reordering is disabled while searching.
+                    .onMove { source, destination in
+                        guard search.isEmpty else { return }
+                        try? vault.move(fromOffsets: source, toOffset: destination)
                     }
                 }
                 .listStyle(.inset)
