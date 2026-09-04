@@ -2,6 +2,8 @@ import AppKit
 import Foundation
 import CryptoKit
 import CommonCrypto
+import LocalAuthentication
+import Security
 
 struct PasswordEntry: Codable, Identifiable, Equatable {
     var id: UUID = UUID()
@@ -34,6 +36,9 @@ class PasswordVault: ObservableObject {
         case corrupted
         case locked
         case weakPassword
+        case biometricsUnavailable
+        case biometricsCanceled
+        case keychain(OSStatus)
 
         var errorDescription: String? {
             switch self {
@@ -43,6 +48,14 @@ class PasswordVault: ObservableObject {
             case .weakPassword:
                 return "The master password must be at least " +
                     "\(PasswordVault.minMasterPasswordLength) characters."
+            case .biometricsUnavailable:
+                return "Touch ID is no longer available for this vault. " +
+                    "Unlock with your master password and enable it again."
+            case .biometricsCanceled:
+                return "Touch ID was canceled."
+            case .keychain(let status):
+                let msg = SecCopyErrorMessageString(status, nil) as String?
+                return "Keychain error: \(msg ?? String(status))"
             }
         }
     }
@@ -53,6 +66,19 @@ class PasswordVault: ObservableObject {
     /// True while an unlock, create, or password change is deriving keys;
     /// the UI should disable submission to prevent overlapping attempts.
     @Published private(set) var busy = false
+
+    /// Whether the derived vault key is stored in the Keychain behind a
+    /// biometric (Touch ID / Watch) access control, so the vault can be
+    /// opened without typing the master password. Mirrors a UserDefaults
+    /// flag; the Keychain item itself is the source of truth and the flag
+    /// is cleared whenever the item turns out to be gone or invalidated.
+    @Published private(set) var biometricsEnabled: Bool
+
+    /// True when this Mac can evaluate a biometric policy right now.
+    var biometricsAvailable: Bool {
+        LAContext().canEvaluatePolicy(
+            .deviceOwnerAuthenticationWithBiometrics, error: nil)
+    }
 
     private var key: SymmetricKey?
     private var salt: Data?
@@ -73,12 +99,21 @@ class PasswordVault: ObservableObject {
     // this target moves past Swift 5 mode.
     nonisolated static let minMasterPasswordLength = 8
 
+    /// Posted by the panel controller when the panel is shown while locked
+    /// and Touch ID is enabled; the unlock view responds by prompting.
+    nonisolated static let biometricUnlockRequested =
+        Notification.Name("PasswordVaultBiometricUnlockRequested")
+
     private static let magic = Data("GHSTYPWV".utf8)
     private static let version: UInt8 = 2
     private static let kdfPBKDF2HmacSHA256: UInt8 = 1
     private static let saltLength = 16
     private static let defaultPBKDF2Iterations: UInt32 = 600_000
     private static let v1PBKDF2Iterations: UInt32 = 210_000
+
+    private static let biometricsDefaultsKey = "PasswordManagerTouchID"
+    private static let keychainService = "com.mitchellh.ghostty.password-manager"
+    private static let keychainAccount = "vault-key"
 
     nonisolated private static var fileURL: URL {
         let dir = FileManager.default.urls(
@@ -92,6 +127,7 @@ class PasswordVault: ObservableObject {
     private init() {
         state = FileManager.default.fileExists(atPath: Self.fileURL.path)
             ? .locked : .uninitialized
+        biometricsEnabled = UserDefaults.standard.bool(forKey: Self.biometricsDefaultsKey)
 
         // Lock whenever the machine sleeps, the screen locks, or the login
         // session deactivates (fast user switching); an unlocked vault
@@ -147,61 +183,75 @@ class PasswordVault: ObservableObject {
         defer { busy = false }
         let generation = self.generation
 
-        let data = try Data(contentsOf: Self.fileURL)
-        guard data.count > Self.magic.count + 1,
-              data.prefix(Self.magic.count) == Self.magic
-        else { throw VaultError.corrupted }
-
-        var offset = Self.magic.count
-        let version = data[offset]
-        offset += 1
-
-        let iterations: UInt32
-        switch version {
-        case 1:
-            iterations = Self.v1PBKDF2Iterations
-        case 2:
-            guard data.count > offset + 5,
-                  data[offset] == Self.kdfPBKDF2HmacSHA256
-            else { throw VaultError.corrupted }
-            offset += 1
-            iterations = data[offset..<(offset + 4)].reduce(0) { ($0 << 8) | UInt32($1) }
-            offset += 4
-            // Reject absurd counts so a tampered header can't stall the app.
-            guard (1_000...100_000_000).contains(iterations)
-            else { throw VaultError.corrupted }
-        default:
-            throw VaultError.corrupted
-        }
-
-        guard data.count > offset + Self.saltLength else { throw VaultError.corrupted }
-        let salt = data.subdata(in: offset..<(offset + Self.saltLength))
-        offset += Self.saltLength
-
+        let file = try Self.readVaultFile()
         let key = try await Self.deriveKey(
-            password: masterPassword, salt: salt, iterations: iterations)
+            password: masterPassword, salt: file.salt, iterations: file.iterations)
         guard generation == self.generation else { throw CancellationError() }
-        let boxData = data.subdata(in: offset..<data.count)
 
-        // A box that can't even be constructed is a truncated/malformed
-        // file, not a wrong password; only authentication failure is.
-        guard let box = try? AES.GCM.SealedBox(combined: boxData)
-        else { throw VaultError.corrupted }
-        let plaintext: Data
-        do {
-            plaintext = try AES.GCM.open(box, using: key)
-        } catch {
-            throw VaultError.badPassword
-        }
+        let decoded = try Self.open(file.box, using: key)
 
-        guard let decoded = try? JSONDecoder().decode([PasswordEntry].self, from: plaintext)
-        else { throw VaultError.corrupted }
-
-        self.salt = salt
+        self.salt = file.salt
         self.key = key
-        self.iterations = iterations
+        self.iterations = file.iterations
         self.entries = decoded
         state = .unlocked
+    }
+
+    /// Unlock using the vault key stored in the Keychain behind Touch ID.
+    /// The system shows the biometric prompt; on cancel this throws
+    /// `VaultError.biometricsCanceled`. If the Keychain item is missing or
+    /// has been invalidated (biometric enrollment changed, app signature
+    /// changed), Touch ID is disabled and `biometricsUnavailable` thrown so
+    /// the UI falls back to the master password.
+    func unlockWithBiometrics() async throws {
+        guard !busy, state == .locked else { return }
+        guard biometricsEnabled else { throw VaultError.biometricsUnavailable }
+        busy = true
+        defer { busy = false }
+        let generation = self.generation
+
+        let file = try Self.readVaultFile()
+        let key: SymmetricKey
+        do {
+            key = try await Self.readKeyFromKeychain()
+        } catch VaultError.biometricsUnavailable {
+            disableBiometrics()
+            throw VaultError.biometricsUnavailable
+        }
+        guard generation == self.generation else { throw CancellationError() }
+
+        let decoded: [PasswordEntry]
+        do {
+            decoded = try Self.open(file.box, using: key)
+        } catch VaultError.badPassword {
+            // The stored key no longer matches the file (e.g. the vault
+            // was replaced on disk). Drop it rather than keep failing.
+            disableBiometrics()
+            throw VaultError.biometricsUnavailable
+        }
+
+        self.salt = file.salt
+        self.key = key
+        self.iterations = file.iterations
+        self.entries = decoded
+        state = .unlocked
+    }
+
+    /// Store the current vault key in the Keychain protected by the
+    /// currently enrolled biometrics. Requires an unlocked vault, which
+    /// proves the caller knew the master password.
+    func enableBiometrics() throws {
+        guard state == .unlocked, let key else { throw VaultError.locked }
+        guard biometricsAvailable else { throw VaultError.biometricsUnavailable }
+        try Self.storeKeyInKeychain(key)
+        UserDefaults.standard.set(true, forKey: Self.biometricsDefaultsKey)
+        biometricsEnabled = true
+    }
+
+    func disableBiometrics() {
+        Self.deleteKeyFromKeychain()
+        UserDefaults.standard.set(false, forKey: Self.biometricsDefaultsKey)
+        biometricsEnabled = false
     }
 
     /// Re-encrypt the vault under a new master password. Requires the
@@ -243,6 +293,18 @@ class PasswordVault: ObservableObject {
             self.key = oldKey
             self.iterations = oldIterations
             throw error
+        }
+
+        // Keep Touch ID working across the change: the stored key is the
+        // derived key, which just changed. Writing needs no biometric
+        // prompt. If the write fails, fall back to disabled rather than
+        // leaving a stale key that can never open the vault.
+        if biometricsEnabled {
+            do {
+                try Self.storeKeyInKeychain(newKey)
+            } catch {
+                disableBiometrics()
+            }
         }
     }
 
@@ -313,6 +375,137 @@ class PasswordVault: ObservableObject {
         } catch {
             try? FileManager.default.removeItem(at: tmpURL)
             throw error
+        }
+    }
+
+    // MARK: - File parsing
+
+    private struct VaultFile {
+        let iterations: UInt32
+        let salt: Data
+        let box: AES.GCM.SealedBox
+    }
+
+    nonisolated private static func readVaultFile() throws -> VaultFile {
+        let data = try Data(contentsOf: fileURL)
+        guard data.count > magic.count + 1,
+              data.prefix(magic.count) == magic
+        else { throw VaultError.corrupted }
+
+        var offset = magic.count
+        let version = data[offset]
+        offset += 1
+
+        let iterations: UInt32
+        switch version {
+        case 1:
+            iterations = v1PBKDF2Iterations
+        case 2:
+            guard data.count > offset + 5,
+                  data[offset] == kdfPBKDF2HmacSHA256
+            else { throw VaultError.corrupted }
+            offset += 1
+            iterations = data[offset..<(offset + 4)].reduce(0) { ($0 << 8) | UInt32($1) }
+            offset += 4
+            // Reject absurd counts so a tampered header can't stall the app.
+            guard (1_000...100_000_000).contains(iterations)
+            else { throw VaultError.corrupted }
+        default:
+            throw VaultError.corrupted
+        }
+
+        guard data.count > offset + saltLength else { throw VaultError.corrupted }
+        let salt = data.subdata(in: offset..<(offset + saltLength))
+        offset += saltLength
+
+        // A box that can't even be constructed is a truncated/malformed
+        // file, not a wrong password; only authentication failure is.
+        guard let box = try? AES.GCM.SealedBox(combined: data.subdata(in: offset..<data.count))
+        else { throw VaultError.corrupted }
+        return VaultFile(iterations: iterations, salt: salt, box: box)
+    }
+
+    nonisolated private static func open(
+        _ box: AES.GCM.SealedBox, using key: SymmetricKey
+    ) throws -> [PasswordEntry] {
+        let plaintext: Data
+        do {
+            plaintext = try AES.GCM.open(box, using: key)
+        } catch {
+            throw VaultError.badPassword
+        }
+        guard let decoded = try? JSONDecoder().decode([PasswordEntry].self, from: plaintext)
+        else { throw VaultError.corrupted }
+        return decoded
+    }
+
+    // MARK: - Keychain (Touch ID)
+
+    nonisolated private static var keychainBaseQuery: [String: Any] {
+        [
+            kSecClass as String: kSecClassGenericPassword,
+            kSecAttrService as String: keychainService,
+            kSecAttrAccount as String: keychainAccount,
+        ]
+    }
+
+    /// Writes the key as a generic-password item readable only after the
+    /// user passes biometric authentication with the *current* enrollment;
+    /// adding or removing a fingerprint invalidates the item. Adding the
+    /// item itself never prompts.
+    nonisolated private static func storeKeyInKeychain(_ key: SymmetricKey) throws {
+        var cfError: Unmanaged<CFError>?
+        guard let access = SecAccessControlCreateWithFlags(
+            nil,
+            kSecAttrAccessibleWhenUnlockedThisDeviceOnly,
+            .biometryCurrentSet,
+            &cfError)
+        else { throw VaultError.keychain(errSecParam) }
+
+        let keyData = key.withUnsafeBytes { Data($0) }
+        deleteKeyFromKeychain()
+        var query = keychainBaseQuery
+        query[kSecAttrAccessControl as String] = access
+        query[kSecValueData as String] = keyData
+        query[kSecAttrLabel as String] = "Ghostty Password Vault"
+        let status = SecItemAdd(query as CFDictionary, nil)
+        guard status == errSecSuccess else { throw VaultError.keychain(status) }
+    }
+
+    nonisolated private static func deleteKeyFromKeychain() {
+        SecItemDelete(keychainBaseQuery as CFDictionary)
+    }
+
+    /// Reads the key back; the system presents the Touch ID sheet. Runs
+    /// off the main actor since the call blocks until the user responds.
+    @concurrent nonisolated private static func readKeyFromKeychain() async throws -> SymmetricKey {
+        let context = LAContext()
+        context.localizedReason = "unlock the password vault"
+        // No "Enter Password" fallback: the item is biometric-only, and the
+        // master password field is the fallback in our own UI.
+        context.localizedFallbackTitle = ""
+
+        var query = keychainBaseQuery
+        query[kSecReturnData as String] = true
+        query[kSecMatchLimit as String] = kSecMatchLimitOne
+        query[kSecUseAuthenticationContext as String] = context
+
+        var result: CFTypeRef?
+        let status = SecItemCopyMatching(query as CFDictionary, &result)
+        switch status {
+        case errSecSuccess:
+            guard let data = result as? Data, data.count == 32
+            else { throw VaultError.biometricsUnavailable }
+            return SymmetricKey(data: data)
+        case errSecUserCanceled, errSecAuthFailed:
+            // errSecAuthFailed is also what a "too many attempts" lockout
+            // surfaces as; treat both as "didn't authenticate this time"
+            // rather than tearing down the Touch ID setup.
+            throw VaultError.biometricsCanceled
+        case errSecItemNotFound, errSecInteractionNotAllowed:
+            throw VaultError.biometricsUnavailable
+        default:
+            throw VaultError.keychain(status)
         }
     }
 

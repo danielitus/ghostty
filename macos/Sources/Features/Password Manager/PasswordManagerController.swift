@@ -43,8 +43,20 @@ class PasswordManagerController: NSWindowController, NSWindowDelegate {
     /// Show the panel. The send target is resolved at send time, not here.
     func show() {
         guard let window else { return }
-        if !window.isVisible { window.center() }
+        let wasVisible = window.isVisible
+        if !wasVisible { window.center() }
         window.makeKeyAndOrderFront(nil)
+
+        // Opening a locked vault with Touch ID enabled goes straight to the
+        // biometric prompt, so a password prompt in the terminal becomes:
+        // panel appears, touch the sensor, pick an entry. Only on a fresh
+        // open; re-raising an already visible panel shouldn't re-prompt.
+        let vault = PasswordVault.shared
+        if !wasVisible, vault.state == .locked,
+           vault.biometricsEnabled, vault.biometricsAvailable {
+            NotificationCenter.default.post(
+                name: PasswordVault.biometricUnlockRequested, object: nil)
+        }
     }
 
     /// Called when a password prompt appears (active) or goes away on the

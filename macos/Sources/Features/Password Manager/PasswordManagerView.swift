@@ -95,13 +95,29 @@ private struct PasswordVaultUnlockView: View {
                 Text(error).font(.caption).foregroundStyle(.red)
             }
 
-            Button("Unlock", action: unlock)
-                .keyboardShortcut(.defaultAction)
-                .disabled(password.isEmpty || vault.busy)
+            HStack {
+                if vault.biometricsEnabled && vault.biometricsAvailable {
+                    Button {
+                        unlockWithBiometrics()
+                    } label: {
+                        Label("Touch ID", systemImage: "touchid")
+                    }
+                    .disabled(vault.busy)
+                    .help("Unlock with Touch ID")
+                }
+                Button("Unlock", action: unlock)
+                    .keyboardShortcut(.defaultAction)
+                    .disabled(password.isEmpty || vault.busy)
+            }
         }
         .padding(20)
         .frame(width: 320)
         .onAppear { focused = true }
+        .onReceive(NotificationCenter.default.publisher(
+            for: PasswordVault.biometricUnlockRequested)
+        ) { _ in
+            unlockWithBiometrics()
+        }
     }
 
     private func unlock() {
@@ -113,6 +129,23 @@ private struct PasswordVaultUnlockView: View {
             } catch {
                 self.error = error.localizedDescription
                 password = ""
+            }
+        }
+    }
+
+    private func unlockWithBiometrics() {
+        guard vault.biometricsEnabled, !vault.busy else { return }
+        Task {
+            do {
+                try await vault.unlockWithBiometrics()
+            } catch PasswordVault.VaultError.biometricsCanceled {
+                // User backed out; the password field is the fallback.
+                focused = true
+            } catch is CancellationError {
+                // Vault was locked mid-prompt; nothing to report.
+            } catch {
+                self.error = error.localizedDescription
+                focused = true
             }
         }
     }
@@ -134,6 +167,7 @@ private struct PasswordListView: View {
     @State private var lockOnClose = UserDefaults.standard.bool(
         forKey: "PasswordManagerLockOnClose")
     @State private var changingPassword = false
+    @State private var touchIDError: String?
 
     private var filtered: [PasswordEntry] {
         guard !search.isEmpty else { return vault.entries }
@@ -270,6 +304,20 @@ private struct PasswordListView: View {
                     Toggle("Open at Password Prompts", isOn: $autoOpen)
                     Toggle("Lock When Window Closes", isOn: $lockOnClose)
                     Divider()
+                    Toggle("Unlock with Touch ID", isOn: Binding(
+                        get: { vault.biometricsEnabled },
+                        set: { on in
+                            if on {
+                                do {
+                                    try vault.enableBiometrics()
+                                } catch {
+                                    touchIDError = error.localizedDescription
+                                }
+                            } else {
+                                vault.disableBiometrics()
+                            }
+                        }))
+                        .disabled(!vault.biometricsAvailable)
                     Button("Change Master Password…") { changingPassword = true }
                 } label: {
                     Image(systemName: "gearshape")
@@ -307,6 +355,14 @@ private struct PasswordListView: View {
         }
         .sheet(isPresented: $changingPassword) {
             ChangeMasterPasswordView(vault: vault)
+        }
+        .alert("Couldn't Enable Touch ID", isPresented: Binding(
+            get: { touchIDError != nil },
+            set: { if !$0 { touchIDError = nil } })
+        ) {
+            Button("OK", role: .cancel) {}
+        } message: {
+            Text(touchIDError ?? "")
         }
     }
 
