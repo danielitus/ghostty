@@ -289,17 +289,10 @@ pub const App = struct {
 
     /// Close the given surface.
     pub fn closeSurface(self: *App, surface: *Surface) void {
-        // A surface whose render thread is wedged can't be torn down:
-        // joining the thread would block the app thread forever, and
-        // freeing state the thread still references could crash us if
-        // it ever wakes up. Detach what we can and leak the rest,
-        // including the surface struct itself.
-        if (surface.core_surface.rendererWedged()) {
-            surface.deinitWedged();
-            return;
-        }
-
-        surface.deinit();
+        // Bounded teardown: a surface whose worker thread never exits is
+        // abandoned (and its memory leaked) rather than joined, since
+        // joining would freeze the app. See Surface.tryDeinit.
+        if (!surface.tryDeinit()) return;
         self.core_app.alloc.destroy(surface);
     }
 
@@ -641,26 +634,34 @@ pub const Surface = struct {
         }
     }
 
+    /// Tear down the surface. Never waits forever for a worker thread:
+    /// see `tryDeinit`. Callers that own the allocation should prefer
+    /// `tryDeinit` so they know whether it may be freed.
     pub fn deinit(self: *Surface) void {
+        _ = self.tryDeinit();
+    }
+
+    /// Tear down the surface with bounded waits for its threads. Returns
+    /// false if the core surface had to be abandoned (a thread never
+    /// exited), in which case this struct must not be freed; the app is
+    /// told so it leaks what those threads can still reach.
+    pub fn tryDeinit(self: *Surface) bool {
         // Shut down our inspector
         self.freeInspector();
 
         // Free our title
         if (self.title) |v| self.app.core_app.alloc.free(v);
+        self.title = null;
 
         // Remove ourselves from the list of known surfaces in the app.
         self.app.core_app.deleteSurface(self);
 
         // Clean up our core surface so that all the rendering and IO stop.
-        self.core_surface.deinit();
-    }
-
-    /// Partial teardown for a surface whose render thread is wedged. See
-    /// `Surface.deinitWedged` in the core; the inspector and title are
-    /// leaked along with everything else the render thread may touch.
-    pub fn deinitWedged(self: *Surface) void {
-        self.app.core_app.deleteSurface(self);
-        self.core_surface.deinitWedged();
+        if (!self.core_surface.tryDeinit()) {
+            self.app.core_app.noteLeakedSurface();
+            return false;
+        }
+        return true;
     }
 
     /// Initialize the inspector instance. A surface can only have one

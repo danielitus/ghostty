@@ -25,7 +25,12 @@ const CURSOR_BLINK_INTERVAL = 600;
 /// The type used for sending messages to the IO thread. For now this is
 /// hardcoded with a capacity. We can make this a comptime parameter in
 /// the future if we want it configurable.
-pub const Mailbox = BlockingQueue(rendererpkg.Message, 64);
+/// Capacity of the render thread mailbox. Producers on the app thread
+/// bound their wait for space (see Surface.pushRendererMessage); when
+/// this thread drains a full mailbox it tells the surface so deferred
+/// state can be delivered.
+pub const mailbox_capacity: usize = 64;
+pub const Mailbox = BlockingQueue(rendererpkg.Message, mailbox_capacity);
 
 /// Allocator used for some state
 alloc: std.mem.Allocator,
@@ -82,6 +87,11 @@ mailbox: *Mailbox,
 
 /// Mailbox to send messages to the app thread
 app_mailbox: App.Mailbox,
+
+/// Set once `threadMain` returns. Lets the owner bound its join: a thread
+/// that never exits (wedged inside a system call) can be detected and
+/// abandoned instead of hanging the joiner forever.
+exited: std.atomic.Value(bool) = .init(false),
 
 /// Configuration we need derived from the main config.
 config: DerivedConfig,
@@ -196,11 +206,26 @@ pub fn deinit(self: *Thread) void {
 
 /// The main entrypoint for the thread.
 pub fn threadMain(self: *Thread) void {
+    defer self.exited.store(true, .release);
+
     // Call child function so we can use errors...
     self.threadMain_() catch |err| {
         // In the future, we should expose this on the thread struct.
         log.warn("error in renderer err={}", .{err});
     };
+}
+
+/// Wait up to `timeout_ns` for the thread to exit. Returns true if it
+/// did, in which case a join returns immediately.
+pub fn waitForExit(self: *const Thread, timeout_ns: u64) bool {
+    const step_ms: u64 = 5;
+    var waited_ns: u64 = 0;
+    while (!self.exited.load(.acquire)) {
+        if (waited_ns >= timeout_ns) return false;
+        std.Io.sleep(global.io(), .fromMilliseconds(step_ms), .awake) catch return false;
+        waited_ns += step_ms * std.time.ns_per_ms;
+    }
+    return true;
 }
 
 fn threadMain_(self: *Thread) !void {
@@ -304,7 +329,9 @@ fn drainMailbox(self: *Thread) !void {
         void;
     defer if (builtin.os.tag.isDarwin()) pool.deinit();
 
+    var drained: usize = 0;
     while (self.mailbox.pop(global.io())) |message| {
+        drained += 1;
         log.debug("mailbox message={}", .{message});
         switch (message) {
             .crash => @panic("crash request, crashing intentionally"),
@@ -444,6 +471,13 @@ fn drainMailbox(self: *Thread) !void {
                 }
             },
         }
+    }
+    // A full mailbox means app-side producers timed out or blocked on us
+    // (see Surface.pushRendererMessage). Now that there is room again,
+    // tell the surface so it can deliver what it deferred. Best effort:
+    // if the app mailbox is full too, the next app-side push retries.
+    if (drained >= mailbox_capacity) {
+        _ = self.renderer.surface_mailbox.push(.{ .renderer_recovered = {} }, .instant);
     }
 }
 

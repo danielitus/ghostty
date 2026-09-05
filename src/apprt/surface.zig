@@ -108,6 +108,11 @@ pub const Message = union(enum) {
     /// Health status change for the renderer.
     renderer_health: renderer.Health,
 
+    /// The render thread drained a mailbox that had been full, so state
+    /// the app thread deferred (see Surface.pushRendererMessage) can be
+    /// delivered now.
+    renderer_recovered: void,
+
     /// Tell the surface to present itself to the user. This may require raising
     /// a window and switching tabs.
     present_surface: void,

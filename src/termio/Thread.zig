@@ -73,6 +73,11 @@ sync_reset: xev.Timer,
 sync_reset_c: xev.Completion = .{},
 sync_reset_cancel_c: xev.Completion = .{},
 
+/// Set once `threadMain` returns. Lets the owner bound its join: a thread
+/// that never exits (its reader stuck on a full app mailbox, say) can be
+/// detected and abandoned instead of hanging the joiner forever.
+exited: std.atomic.Value(bool) = .init(false),
+
 flags: packed struct {
     /// This is set to true only when an abnormal exit is detected. It
     /// tells our mailbox system to drain and ignore all messages.
@@ -134,6 +139,8 @@ pub fn deinit(self: *Thread) void {
 
 /// The main entrypoint for the thread.
 pub fn threadMain(self: *Thread, io: *termio.Termio) void {
+    defer self.exited.store(true, .release);
+
     // Call child function so we can use errors...
     self.threadMain_(io) catch |err| {
         log.warn("error in io thread err={}", .{err});
@@ -232,6 +239,19 @@ pub fn threadMain(self: *Thread, io: *termio.Termio) void {
             log.err("failed to start xev loop for draining err={}", .{err});
         };
     }
+}
+
+/// Wait up to `timeout_ns` for the thread to exit. Returns true if it
+/// did, in which case a join returns immediately.
+pub fn waitForExit(self: *const Thread, timeout_ns: u64) bool {
+    const step_ms: u64 = 5;
+    var waited_ns: u64 = 0;
+    while (!self.exited.load(.acquire)) {
+        if (waited_ns >= timeout_ns) return false;
+        std.Io.sleep(global.io(), .fromMilliseconds(step_ms), .awake) catch return false;
+        waited_ns += step_ms * std.time.ns_per_ms;
+    }
+    return true;
 }
 
 fn threadMain_(self: *Thread, io: *termio.Termio) !void {

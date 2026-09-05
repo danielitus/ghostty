@@ -70,6 +70,11 @@ config_conditional_state: configpkg.ConditionalState,
 /// if they are the first surface.
 first: bool = true,
 
+/// Surfaces that were abandoned rather than torn down because a worker
+/// thread never exited (see Surface.tryDeinit). Their threads may still
+/// reference the font grid set and this app, so those are leaked too.
+leaked_surfaces: usize = 0,
+
 pub const CreateError = Allocator.Error || font.SharedGridSet.InitError;
 
 /// Create a new app instance. This returns a stable pointer to the app
@@ -134,12 +139,29 @@ pub fn deinit(self: *App) void {
     for (self.surfaces.items) |surface| surface.deinit();
     self.surfaces.deinit(self.alloc);
 
+    // If any surface was abandoned with a live thread, that thread can
+    // still reach the font grid set (it holds a ref) and this app's
+    // mailbox. Leak them rather than free memory a thread may touch.
+    if (self.leaked_surfaces > 0) {
+        log.warn(
+            "leaking app resources: {d} surface(s) abandoned with live threads",
+            .{self.leaked_surfaces},
+        );
+        return;
+    }
+
     // Clean up our font group cache
     // We should have zero items in the grid set at this point because
     // destroy only gets called when the app is shutting down and this
     // should gracefully close all surfaces.
     assert(self.font_grid_set.count() == 0);
     self.font_grid_set.deinit();
+}
+
+/// Record that a surface was abandoned instead of torn down. See
+/// `Surface.tryDeinit`.
+pub fn noteLeakedSurface(self: *App) void {
+    self.leaked_surfaces += 1;
 }
 
 pub fn destroy(self: *App) void {

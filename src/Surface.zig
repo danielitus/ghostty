@@ -168,8 +168,8 @@ renderer_pending: RendererPending = .{},
 
 /// True while the render thread is considered wedged: an app-thread push
 /// timed out and none has succeeded since. Pushes then fail fast instead
-/// of stalling the UI again, and closing the surface leaks its resources
-/// rather than joining a thread that will never exit.
+/// of stalling the UI again, and bounded teardown (`tryDeinit`) gives the
+/// thread no grace period before abandoning it.
 renderer_wedged: bool = false,
 
 /// The font grid key the render thread currently holds. This lags
@@ -815,14 +815,39 @@ pub fn init(
     app.first = false;
 }
 
+/// How long bounded teardown waits for a worker thread to exit before
+/// abandoning it. See `tryDeinit`.
+const thread_exit_timeout_ns: u64 = 5 * std.time.ns_per_s;
+
+/// Tear down the surface, waiting for its threads however long they take.
+/// A thread that never exits hangs the caller here (upstream behavior);
+/// apprts that can tolerate a leak instead should use `tryDeinit`.
 pub fn deinit(self: *Surface) void {
-    // A wedged render thread never exits, so joining it would hang the
-    // app thread forever. Apprts should check `rendererWedged` and call
-    // `deinitWedged` (and not free the surface memory); if one gets here
-    // anyway, a leak still beats a frozen app.
-    if (self.renderer_wedged) {
-        self.deinitWedged();
-        return;
+    _ = self.deinitImpl(null);
+}
+
+/// Tear down the surface without ever waiting more than a bounded time
+/// for a worker thread to exit. Returns false if a thread did not exit in
+/// time: it was detached, and everything it can still touch (renderer,
+/// terminal state, mailboxes, config, font grid refs, and this struct)
+/// was intentionally leaked so that a thread which wakes up late finds
+/// valid memory. The caller must not free the surface afterwards and
+/// should tell the app via `App.noteLeakedSurface`.
+pub fn tryDeinit(self: *Surface) bool {
+    // A render thread already known to be wedged gets no grace period.
+    return self.deinitImpl(if (self.renderer_wedged) 0 else thread_exit_timeout_ns);
+}
+
+fn deinitImpl(self: *Surface, timeout_ns: ?u64) bool {
+    if (timeout_ns) |t| {
+        // Bounded: ask the render thread to stop and confirm it actually
+        // exits before joining anything. The search thread pushes into
+        // the render mailbox with no timeout, so a wedged render thread
+        // strands it as well; checking the renderer first means we never
+        // join the search thread in that state.
+        self.renderer_thread.stop.notify() catch |err|
+            log.err("error notifying renderer thread to stop, may stall err={}", .{err});
+        if (!self.renderer_thread.waitForExit(t)) return self.abandon(.renderer);
     }
 
     // Stop search thread
@@ -830,8 +855,10 @@ pub fn deinit(self: *Surface) void {
 
     // Stop rendering thread
     {
-        self.renderer_thread.stop.notify() catch |err|
-            log.err("error notifying renderer thread to stop, may stall err={}", .{err});
+        if (timeout_ns == null) {
+            self.renderer_thread.stop.notify() catch |err|
+                log.err("error notifying renderer thread to stop, may stall err={}", .{err});
+        }
         self.renderer_thr.join();
 
         // We need to become the active rendering thread again
@@ -842,6 +869,9 @@ pub fn deinit(self: *Surface) void {
     {
         self.io_thread.stop.notify() catch |err|
             log.err("error notifying io thread to stop, may stall err={}", .{err});
+        if (timeout_ns) |t| {
+            if (!self.io_thread.waitForExit(t)) return self.abandon(.io);
+        }
         self.io_thr.join();
     }
 
@@ -876,44 +906,32 @@ pub fn deinit(self: *Surface) void {
     self.config.deinit();
 
     log.info("surface closed id={x}", .{self.id});
+    return true;
 }
 
-/// True once an app-thread push to the render thread timed out and no
-/// push has succeeded since. Apprts use this to avoid joining the render
-/// thread on close; see `deinitWedged`.
-pub fn rendererWedged(self: *const Surface) bool {
-    return self.renderer_wedged;
-}
-
-/// Tear down as much of a surface as is safe when its render thread is
-/// wedged (see `pushRendererMessage`). The render thread is detached,
-/// never joined, and everything it can still touch (renderer, terminal
-/// state, mailbox, config, font grid refs, the surface struct itself) is
-/// intentionally leaked so a thread that wakes up late finds valid
-/// memory. The IO thread is independent of the render thread since its
-/// renderer pushes are bounded, so it is stopped normally, which kills
-/// the child process. Callers must not free the surface afterwards.
-pub fn deinitWedged(self: *Surface) void {
+/// Abandon teardown because a worker thread did not exit in time. Every
+/// thread not yet joined is detached (it exits on its own if it ever
+/// recovers, and its stop request is already queued), and nothing it can
+/// reach is freed. Returns false for `deinitImpl`.
+fn abandon(self: *Surface, stuck: enum { renderer, io }) bool {
     log.warn(
-        "render thread is wedged; leaking surface instead of joining it id={x}",
-        .{self.id},
+        "{s} thread did not exit in time; leaking surface instead of joining it id={x}",
+        .{ @tagName(stuck), self.id },
     );
-
-    // Ask it to stop anyway: if it ever recovers it exits on its own.
-    self.renderer_thread.stop.notify() catch {};
-    self.renderer_thr.detach();
-
-    // The search thread pushes to the render mailbox with no timeout,
-    // so it may be stuck in the same way. Leave it.
-
-    // Stop our IO thread. This kills the child process and quits the
-    // read thread; the terminal state it shares with the renderer is
-    // left allocated.
-    self.io_thread.stop.notify() catch |err|
-        log.err("error notifying io thread to stop, may stall err={}", .{err});
-    self.io_thr.join();
-
-    log.info("surface leaked id={x}", .{self.id});
+    self.renderer_wedged = true;
+    switch (stuck) {
+        .renderer => {
+            self.renderer_thr.detach();
+            // Still ask the IO thread to stop: it is independent of the
+            // render thread (its renderer pushes are bounded), so it will
+            // exit and kill the child process, just not while we wait.
+            self.io_thread.stop.notify() catch {};
+            self.io_thr.detach();
+        },
+        // The render thread already exited and was joined.
+        .io => self.io_thr.detach(),
+    }
+    return false;
 }
 
 /// Close this surface. This will trigger the runtime to start the
@@ -1175,6 +1193,8 @@ pub fn handleMessage(self: *Surface, msg: Message) !void {
         },
 
         .renderer_health => |health| self.updateRendererHealth(health),
+
+        .renderer_recovered => self.rendererRecovered(),
 
         .scrollbar => |scrollbar| self.updateScrollbar(scrollbar),
 
@@ -2558,7 +2578,7 @@ fn applyFontGrid(self: *Surface, font_grid: *font.SharedGrid) !void {
 fn queueRender(self: *Surface) !void {
     // Give deferred state changes another chance every time we ask the
     // render thread to draw; this is how a recovered thread catches up.
-    if (!self.renderer_pending.isEmpty()) self.flushPendingRendererMessages();
+    if (!self.renderer_pending.isEmpty()) _ = self.flushPendingRendererMessages();
     try self.renderer_thread.wakeup.notify();
 }
 
@@ -3429,8 +3449,13 @@ pub fn pushRendererMessage(self: *Surface, msg: rendererpkg.Message) bool {
     // A newer message of the same kind supersedes anything pending.
     self.supersedePendingRendererMessage(msg);
 
-    // Preserve ordering: deliver what was deferred before this one.
-    self.flushPendingRendererMessages();
+    // Preserve ordering: everything deferred earlier must be delivered
+    // before this message, so if any of it still can't be, this one
+    // waits behind it rather than overtaking it.
+    if (!self.flushPendingRendererMessages()) {
+        self.deferRendererMessage(msg);
+        return false;
+    }
 
     if (self.tryPushRendererMessage(msg)) return true;
     self.deferRendererMessage(msg);
@@ -3499,17 +3524,18 @@ fn deferRendererMessage(self: *Surface, msg: rendererpkg.Message) void {
 
 /// Retry deferred messages in a fixed order (config before font grid,
 /// then display, visibility, focus). Stops at the first failure so
-/// ordering between kinds is preserved.
-fn flushPendingRendererMessages(self: *Surface) void {
+/// ordering between kinds is preserved. Returns true once nothing is
+/// pending any more.
+fn flushPendingRendererMessages(self: *Surface) bool {
     const p = &self.renderer_pending;
 
     if (p.change_config) |msg| {
-        if (!self.tryPushRendererMessage(msg)) return;
+        if (!self.tryPushRendererMessage(msg)) return false;
         p.change_config = null;
     }
 
     if (p.font_grid) |msg| {
-        if (!self.tryPushRendererMessage(msg)) return;
+        if (!self.tryPushRendererMessage(msg)) return false;
         p.font_grid = null;
         // The renderer holds the grid now; bring the terminal to match.
         self.applyFontGrid(msg.font_grid.grid) catch |err| {
@@ -3518,19 +3544,34 @@ fn flushPendingRendererMessages(self: *Surface) void {
     }
 
     if (p.macos_display_id) |id| {
-        if (!self.tryPushRendererMessage(.{ .macos_display_id = id })) return;
+        if (!self.tryPushRendererMessage(.{ .macos_display_id = id })) return false;
         p.macos_display_id = null;
     }
 
     if (p.visible) |v| {
-        if (!self.tryPushRendererMessage(.{ .visible = v })) return;
+        if (!self.tryPushRendererMessage(.{ .visible = v })) return false;
         p.visible = null;
     }
 
     if (p.focus) |v| {
-        if (!self.tryPushRendererMessage(.{ .focus = v })) return;
+        if (!self.tryPushRendererMessage(.{ .focus = v })) return false;
         p.focus = null;
     }
+
+    return true;
+}
+
+/// The render thread drained a mailbox that had been full. Deliver what
+/// was deferred, and reconcile geometry unconditionally: the IO thread
+/// drops a resize it cannot hand over in time, and if that was the last
+/// resize nothing else would repair it.
+fn rendererRecovered(self: *Surface) void {
+    log.info("render thread recovered; reconciling deferred state id={x}", .{self.id});
+    _ = self.flushPendingRendererMessages();
+    _ = self.tryPushRendererMessage(.{ .resize = self.size });
+    self.queueRender() catch |err| {
+        log.warn("error queueing render after renderer recovery err={}", .{err});
+    };
 }
 
 /// Release resources owned by deferred messages. Only valid once the
