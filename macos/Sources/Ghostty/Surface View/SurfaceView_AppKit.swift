@@ -139,6 +139,8 @@ extension Ghostty {
                     input.setScoped(id, focused: focused)
                 } else {
                     input.removeScoped(id)
+                    // A new prompt gets a fresh offer.
+                    passwordManagerOffered = false
                 }
 
                 // Offer the password manager when a password prompt is
@@ -151,6 +153,12 @@ extension Ghostty {
                 }
             }
         }
+
+        // True once the password manager has been offered for the password
+        // prompt currently active on this surface. Reset when the prompt
+        // ends, so closing the panel and refocusing the terminal doesn't
+        // reopen it for the same prompt.
+        var passwordManagerOffered = false
 
         // Returns true if quit confirmation is required for this surface to
         // exit safely.

@@ -46,6 +46,15 @@ class PasswordVault: ObservableObject {
         case locked
         case weakPassword
         case staleVault
+        /// Another operation (unlock, create, password change) is still
+        /// running; the caller must not treat the call as done.
+        case busy
+        /// Another Ghostty instance holds the vault file lock and did not
+        /// release it within the (short) bounded wait.
+        case fileBusy
+        /// The vault (or Touch ID wrapper) predates the authenticated
+        /// header format; a master-password unlock upgrades it.
+        case legacyNeedsPassword
         /// Touch ID setup is confirmed dead (no fingerprints enrolled, or
         /// the wrapped key file is missing or corrupt). Setup is torn down.
         case biometricsUnavailable
@@ -69,6 +78,13 @@ class PasswordVault: ObservableObject {
             case .staleVault:
                 return "The vault file was changed by another Ghostty instance. " +
                     "Reload it before making changes."
+            case .busy:
+                return "Another vault operation is still in progress."
+            case .fileBusy:
+                return "Another Ghostty instance is using the vault file. Try again in a moment."
+            case .legacyNeedsPassword:
+                return "This vault uses an older file format. Unlock with your master " +
+                    "password once to upgrade it; Touch ID will work after that."
             case .biometricsUnavailable:
                 return "Touch ID is no longer available for this vault. " +
                     "Unlock with your master password and enable it again."
@@ -200,7 +216,7 @@ class PasswordVault: ObservableObject {
     // MARK: - Locking
 
     func create(masterPassword: String) async throws {
-        guard !busy else { return }
+        guard !busy else { throw VaultError.busy }
         guard state == .uninitialized else { throw VaultError.locked }
         guard masterPassword.count >= Self.minMasterPasswordLength
         else { throw VaultError.weakPassword }
@@ -237,7 +253,7 @@ class PasswordVault: ObservableObject {
     }
 
     func unlock(masterPassword: String) async throws {
-        guard !busy else { return }
+        guard !busy else { throw VaultError.busy }
         busy = true
         defer { busy = false }
         let generation = self.generation
@@ -250,6 +266,28 @@ class PasswordVault: ObservableObject {
 
         let decoded = try Self.open(file, using: key)
         adopt(file: file, key: key, entries: decoded)
+
+        // The derived key opened the box, which proves the salt and
+        // iteration count in a pre-v3 header are the real ones. Seal them
+        // into a v3 header now, and refresh the Touch ID wrapper so it
+        // carries the vault binding, before Touch ID is allowed to bypass
+        // the KDF on this vault again. Failure here is not an unlock
+        // failure; the next save upgrades the file anyway.
+        if file.version < Self.version { upgradeLegacyVault() }
+    }
+
+    private func upgradeLegacyVault() {
+        guard state == .unlocked, let key, let salt else { return }
+        var wrapped: Data?
+        if biometricsEnabled {
+            wrapped = try? Self.makeWrappedKeyData(key, vaultSalt: salt)
+            if wrapped == nil { disableBiometrics(deleteWrappedKeyMatching: nil) }
+        }
+        if let digest = try? Self.writeVault(
+            entries: entries, key: key, salt: salt, iterations: iterations,
+            expectedDigest: diskDigest, wrappedKey: wrapped) {
+            diskDigest = digest
+        }
     }
 
     /// Unlock using the Secure Enclave-wrapped vault key behind Touch ID.
@@ -260,13 +298,22 @@ class PasswordVault: ObservableObject {
     /// automatic prompts and keeps the file; every other failure is
     /// reported and leaves the setup alone.
     func unlockWithBiometrics() async throws {
-        guard !busy, state == .locked else { return }
+        guard state == .locked else { return }
+        guard !busy else { throw VaultError.busy }
         guard biometricsEnabled else { throw VaultError.biometricsUnavailable }
         busy = true
         defer { busy = false }
         let generation = self.generation
 
-        let file = try Self.readVaultFile()
+        // One shared-lock snapshot of both files, so the wrapper we
+        // authenticate against belongs to the vault we then open.
+        let (file, wrappedKeyData) = try Self.readVaultFiles()
+
+        // A pre-v3 vault has an unauthenticated header. Opening it with a
+        // key that bypasses the KDF would let a tampered iteration count
+        // or salt be adopted and then sealed into the v3 upgrade, so the
+        // upgrade is only ever done after a master-password unlock.
+        guard file.version >= Self.version else { throw VaultError.legacyNeedsPassword }
 
         let context = LAContext()
         context.localizedReason = "unlock the password vault"
@@ -279,15 +326,20 @@ class PasswordVault: ObservableObject {
         let key: SymmetricKey
         do {
             key = try await Self.unwrapKey(
-                context: AuthContextBox(context), vaultSalt: file.salt)
+                wrappedKeyData, context: AuthContextBox(context), vaultSalt: file.salt)
         } catch let error as VaultError {
-            // Destructive cleanup only for a confirmed dead setup, and
-            // only if nothing locked (or re-unlocked) the vault meanwhile.
+            // Destructive cleanup only for a confirmed dead setup, only if
+            // nothing locked (or re-unlocked) the vault meanwhile, and
+            // only of the exact wrapper we inspected: another instance
+            // may have installed a fresh one since.
             if generation == self.generation {
                 switch error {
-                case .biometricsUnavailable: disableBiometrics()
-                case .biometricsMismatch: disableBiometrics(deleteWrappedKey: false)
-                default: break
+                case .biometricsUnavailable:
+                    disableBiometrics(deleteWrappedKeyMatching: wrappedKeyData)
+                case .biometricsMismatch:
+                    disableBiometrics(deleteWrappedKeyMatching: nil)
+                default:
+                    break
                 }
             }
             throw error
@@ -299,10 +351,10 @@ class PasswordVault: ObservableObject {
             decoded = try Self.open(file, using: key)
         } catch VaultError.badPassword {
             // The unwrapped key does not decrypt this vault: the vault was
-            // replaced on disk or (v3) its header was tampered with. Keep
-            // the wrapped key on disk; it is harmless and re-enabling
+            // replaced on disk or its header was tampered with. Keep the
+            // wrapped key on disk; it is harmless and re-enabling
             // overwrites it.
-            if generation == self.generation { disableBiometrics(deleteWrappedKey: false) }
+            if generation == self.generation { disableBiometrics(deleteWrappedKeyMatching: nil) }
             throw VaultError.biometricsMismatch
         }
 
@@ -344,13 +396,27 @@ class PasswordVault: ObservableObject {
             throw VaultError.biometricsSetupFailed(
                 "Touch ID is not available on this Mac right now.")
         }
-        try Self.storeWrappedKey(key, vaultSalt: salt)
+        // Installed under the vault lock only if the vault on disk is
+        // still the one this key opens; otherwise another instance has
+        // changed it (and maybe the master password) and this key would
+        // overwrite a valid wrapper with a stale one.
+        try Self.storeWrappedKey(key, vaultSalt: salt, expectedDigest: diskDigest)
         UserDefaults.standard.set(true, forKey: Self.biometricsDefaultsKey)
         biometricsEnabled = true
     }
 
-    func disableBiometrics(deleteWrappedKey: Bool = true) {
-        if deleteWrappedKey { Self.deleteWrappedKey() }
+    /// Turn Touch ID off. The wrapped key file is deleted only when
+    /// `deleteWrappedKeyMatching` is the exact content that was found to be
+    /// unusable; passing nil keeps whatever is on disk.
+    func disableBiometrics(deleteWrappedKeyMatching stale: Data? = nil) {
+        if let stale { Self.deleteWrappedKey(matching: stale) }
+        UserDefaults.standard.set(false, forKey: Self.biometricsDefaultsKey)
+        biometricsEnabled = false
+    }
+
+    /// Turn Touch ID off from the UI, removing the wrapped key.
+    func disableBiometricsAndForget() {
+        Self.deleteWrappedKey(matching: nil)
         UserDefaults.standard.set(false, forKey: Self.biometricsDefaultsKey)
         biometricsEnabled = false
     }
@@ -360,7 +426,7 @@ class PasswordVault: ObservableObject {
     /// the caller knows it, not just that the panel is open. Honors task
     /// cancellation up to the moment the file is written.
     func changeMasterPassword(current: String, new: String) async throws {
-        guard !busy else { return }
+        guard !busy else { throw VaultError.busy }
         guard state == .unlocked, let salt, let key else { throw VaultError.locked }
         guard new.count >= Self.minMasterPasswordLength
         else { throw VaultError.weakPassword }
@@ -380,28 +446,28 @@ class PasswordVault: ObservableObject {
         guard generation == self.generation else { throw CancellationError() }
         try Task.checkCancellation()
 
-        // Write first; memory changes only once the file is safely on disk
-        // so a failed save never leaves memory and disk expecting
-        // different passwords.
+        // Keep Touch ID working across the change: the wrapped key is the
+        // derived key, which just changed. Re-wrapping needs no biometric
+        // prompt. If it can't be prepared, fall back to disabled rather
+        // than leaving a stale key that can never open the vault.
+        var wrapped: Data?
+        if biometricsEnabled {
+            wrapped = try? Self.makeWrappedKeyData(newKey, vaultSalt: newSalt)
+            if wrapped == nil { disableBiometrics(deleteWrappedKeyMatching: nil) }
+        }
+
+        // Write first; memory changes only once the files are safely on
+        // disk so a failed save never leaves memory and disk expecting
+        // different passwords. Vault and wrapper are replaced under one
+        // lock so no reader ever sees a new vault with the old wrapper.
         let digest = try Self.writeVault(
             entries: entries, key: newKey, salt: newSalt,
-            iterations: Self.defaultPBKDF2Iterations, expectedDigest: diskDigest)
+            iterations: Self.defaultPBKDF2Iterations, expectedDigest: diskDigest,
+            wrappedKey: wrapped)
         self.salt = newSalt
         self.key = newKey
         self.iterations = Self.defaultPBKDF2Iterations
         self.diskDigest = digest
-
-        // Keep Touch ID working across the change: the wrapped key is the
-        // derived key, which just changed. Re-wrapping needs no biometric
-        // prompt. If it fails, fall back to disabled rather than leaving a
-        // stale key that can never open the vault.
-        if biometricsEnabled {
-            do {
-                try Self.storeWrappedKey(newKey, vaultSalt: newSalt)
-            } catch {
-                disableBiometrics()
-            }
-        }
     }
 
     func lock() {
@@ -477,14 +543,17 @@ class PasswordVault: ObservableObject {
     /// Serialize, encrypt, and atomically write the vault. Holds the
     /// cross-process lock across the staleness check and the replace.
     /// `expectedDigest` is the digest of the file this instance last saw
-    /// (`nil` when creating: the file must not exist). Returns the digest
-    /// of the file just written.
+    /// (`nil` when creating: the file must not exist). When `wrappedKey`
+    /// is given it is installed under the same lock, right after the
+    /// vault, so the pair is never observed half-updated. Returns the
+    /// digest of the vault file just written.
     nonisolated private static func writeVault(
         entries: [PasswordEntry],
         key: SymmetricKey,
         salt: Data,
         iterations: UInt32,
-        expectedDigest: Data?
+        expectedDigest: Data?,
+        wrappedKey: Data? = nil
     ) throws -> Data {
         var plaintext = try JSONEncoder().encode(entries)
         defer { plaintext.resetBytes(in: 0..<plaintext.count) }
@@ -515,6 +584,7 @@ class PasswordVault: ObservableObject {
         }
 
         try writeOwnerOnly(data, to: fileURL)
+        if let wrappedKey { try writeOwnerOnly(wrappedKey, to: wrappedKeyURL) }
         return digest(of: data)
     }
 
@@ -544,9 +614,12 @@ class PasswordVault: ObservableObject {
 
     /// Write `data` to `url` so that at no point does a file with wider
     /// than owner-only permissions or partial contents exist at `url`:
-    /// exclusive creation of a uniquely named temp file with mode 0600,
-    /// fsync, then an atomic replace that keeps the temp file's metadata
-    /// (the original's mode is deliberately not preserved).
+    /// exclusive creation of a uniquely named temp file with mode 0600
+    /// (fchmod'ed to exactly that, whatever the umask), fsync, then an
+    /// atomic replace that keeps the temp file's metadata (the original's
+    /// mode is deliberately not preserved). Nothing that can fail runs
+    /// after the replace, so a thrown error always means the old file is
+    /// still in place.
     nonisolated private static func writeOwnerOnly(_ data: Data, to url: URL) throws {
         let tmpURL = url.deletingLastPathComponent().appendingPathComponent(
             ".\(url.lastPathComponent).\(UUID().uuidString).tmp")
@@ -559,6 +632,7 @@ class PasswordVault: ObservableObject {
             if !closed { _ = Darwin.close(fd) }
             if !installed { try? FileManager.default.removeItem(at: tmpURL) }
         }
+        guard fchmod(fd, 0o600) == 0 else { throw posixError() }
 
         try data.withUnsafeBytes { (buf: UnsafeRawBufferPointer) in
             guard let base = buf.baseAddress else { return }
@@ -584,8 +658,6 @@ class PasswordVault: ObservableObject {
             try FileManager.default.moveItem(at: tmpURL, to: url)
         }
         installed = true
-        try FileManager.default.setAttributes(
-            [.posixPermissions: 0o600], ofItemAtPath: url.path)
     }
 
     nonisolated private static func posixError() -> Error {
@@ -605,18 +677,36 @@ class PasswordVault: ObservableObject {
     /// Cross-process mutual exclusion for vault and wrapped-key writes,
     /// via flock(2) on a lock file beside the vault. Readers take it
     /// shared so they never observe a half-replaced pair of files.
+    ///
+    /// Acquisition never blocks indefinitely: most callers run on the
+    /// main actor, and a peer instance that is suspended while holding
+    /// the lock must not freeze this one. The lock is polled without
+    /// blocking for a short bounded time (holders keep it for
+    /// milliseconds), then `fileBusy` is thrown for the user to retry.
     private struct VaultLock {
         private let fd: Int32
+
+        private static let acquireTimeout: DispatchTimeInterval = .milliseconds(500)
+        private static let pollInterval: useconds_t = 10_000
 
         nonisolated static func acquire(exclusive: Bool) throws -> VaultLock {
             let fd = Darwin.open(lockFileURL.path, O_RDWR | O_CREAT | O_CLOEXEC, 0o600)
             guard fd >= 0 else { throw posixError() }
-            guard flock(fd, exclusive ? LOCK_EX : LOCK_SH) == 0 else {
-                let error = posixError()
-                _ = Darwin.close(fd)
-                throw error
+            let operation = (exclusive ? LOCK_EX : LOCK_SH) | LOCK_NB
+            let deadline = DispatchTime.now() + acquireTimeout
+            while true {
+                if flock(fd, operation) == 0 { return VaultLock(fd: fd) }
+                let code = errno
+                if code != EWOULDBLOCK && code != EINTR {
+                    _ = Darwin.close(fd)
+                    throw NSError(domain: NSPOSIXErrorDomain, code: Int(code))
+                }
+                if DispatchTime.now() >= deadline {
+                    _ = Darwin.close(fd)
+                    throw VaultError.fileBusy
+                }
+                usleep(pollInterval)
             }
-            return VaultLock(fd: fd)
         }
 
         nonisolated func release() {
@@ -638,8 +728,23 @@ class PasswordVault: ObservableObject {
     }
 
     nonisolated private static func readVaultFile() throws -> VaultFile {
+        try readVaultFiles().vault
+    }
+
+    /// Read the vault and, if present, the Touch ID wrapper under one
+    /// shared lock, so the two always come from the same point in time.
+    nonisolated private static func readVaultFiles() throws -> (vault: VaultFile, wrappedKey: Data?) {
         let lock = try VaultLock.acquire(exclusive: false)
         defer { lock.release() }
+
+        let wrappedKey: Data?
+        do {
+            wrappedKey = try readIfExists(wrappedKeyURL)
+        } catch {
+            // A wrapper that can't be read right now is treated as absent
+            // by the caller; that is never destructive.
+            wrappedKey = nil
+        }
 
         let data = try Data(contentsOf: fileURL)
         guard data.count > magic.count + 1,
@@ -677,9 +782,12 @@ class PasswordVault: ObservableObject {
         // file, not a wrong password; only authentication failure is.
         guard let box = try? AES.GCM.SealedBox(combined: data.subdata(in: offset..<data.count))
         else { throw VaultError.corrupted }
-        return VaultFile(
-            version: version, iterations: iterations, salt: salt,
-            header: header, box: box, digest: digest(of: data))
+        return (
+            VaultFile(
+                version: version, iterations: iterations, salt: salt,
+                header: header, box: box, digest: digest(of: data)),
+            wrappedKey
+        )
     }
 
     nonisolated private static func open(
@@ -716,7 +824,12 @@ class PasswordVault: ObservableObject {
     /// Unlocking reverses this; the ECDH on the SE side is what triggers
     /// the Touch ID sheet.
     private static let wrappedKeyMagic = Data("GHSTYTID".utf8)
-    private static let wrappedKeyVersion: UInt8 = 1
+    /// v2 binds the vault salt as GCM associated data. v1 (no AAD) is
+    /// recognized but never used: any vault old enough to have one is
+    /// pre-v3 and is upgraded, wrapper included, by a master-password
+    /// unlock first.
+    private static let wrappedKeyVersion: UInt8 = 2
+    private static let wrappedKeyLegacyVersion: UInt8 = 1
     private static let wrappedKeyInfo = Data("ghostty-password-vault-touchid".utf8)
 
     nonisolated private static var wrappedKeyURL: URL {
@@ -731,7 +844,22 @@ class PasswordVault: ObservableObject {
         init(_ context: LAContext) { self.context = context }
     }
 
-    nonisolated private static func storeWrappedKey(_ key: SymmetricKey, vaultSalt: Data) throws {
+    /// Install a wrapped key, but only if the vault on disk still has
+    /// `expectedDigest`: the key must belong to the vault it sits beside.
+    nonisolated private static func storeWrappedKey(
+        _ key: SymmetricKey, vaultSalt: Data, expectedDigest: Data?
+    ) throws {
+        let data = try makeWrappedKeyData(key, vaultSalt: vaultSalt)
+        let lock = try VaultLock.acquire(exclusive: true)
+        defer { lock.release() }
+        guard let onDisk = try readIfExists(fileURL), digest(of: onDisk) == expectedDigest
+        else { throw VaultError.staleVault }
+        try writeOwnerOnly(data, to: wrappedKeyURL)
+    }
+
+    /// Build the wrapped-key file contents for `key`. Creates a fresh
+    /// Secure Enclave key; no biometric prompt is involved.
+    nonisolated private static func makeWrappedKeyData(_ key: SymmetricKey, vaultSalt: Data) throws -> Data {
         var cfError: Unmanaged<CFError>?
         guard let access = SecAccessControlCreateWithFlags(
             nil,
@@ -772,15 +900,18 @@ class PasswordVault: ObservableObject {
         data.append(ephPub)
         data.append(salt)
         data.append(sealed)
-
-        let lock = try VaultLock.acquire(exclusive: true)
-        defer { lock.release() }
-        try writeOwnerOnly(data, to: wrappedKeyURL)
+        return data
     }
 
-    nonisolated private static func deleteWrappedKey() {
+    /// Remove the wrapped key file. With `matching` set, only a file whose
+    /// contents are exactly those bytes is removed, so a wrapper another
+    /// instance installed in the meantime is never deleted by mistake.
+    nonisolated private static func deleteWrappedKey(matching stale: Data?) {
         guard let lock = try? VaultLock.acquire(exclusive: true) else { return }
         defer { lock.release() }
+        if let stale {
+            guard let current = try? readIfExists(wrappedKeyURL), current == stale else { return }
+        }
         try? FileManager.default.removeItem(at: wrappedKeyURL)
     }
 
@@ -789,24 +920,12 @@ class PasswordVault: ObservableObject {
     /// user responds. Errors are classified so callers can tell a dead
     /// setup from a transient failure; see `VaultError`.
     @concurrent nonisolated private static func unwrapKey(
+        _ wrappedKeyData: Data?,
         context box: AuthContextBox,
         vaultSalt: Data
     ) async throws -> SymmetricKey {
-        let data: Data
-        do {
-            let lock = try VaultLock.acquire(exclusive: false)
-            defer { lock.release() }
-            guard let read = try readIfExists(wrappedKeyURL) else {
-                // Nothing to use: confirmed.
-                throw VaultError.biometricsUnavailable
-            }
-            data = read
-        } catch let error as VaultError {
-            throw error
-        } catch {
-            // A read that fails for any other reason may be transient.
-            throw VaultError.biometricsFailed(describe(error))
-        }
+        // Nothing to use: confirmed.
+        guard let data = wrappedKeyData else { throw VaultError.biometricsUnavailable }
 
         // Parse; a malformed file is confirmed unusable, not transient.
         var offset = 0
@@ -819,9 +938,14 @@ class PasswordVault: ObservableObject {
             let b = try take(2)
             return Int(b[b.startIndex]) << 8 | Int(b[b.startIndex + 1])
         }
-        guard try take(wrappedKeyMagic.count) == wrappedKeyMagic,
-              try take(1).first == wrappedKeyVersion
-        else { throw VaultError.biometricsUnavailable }
+        guard try take(wrappedKeyMagic.count) == wrappedKeyMagic else {
+            throw VaultError.biometricsUnavailable
+        }
+        switch try take(1).first {
+        case wrappedKeyVersion: break
+        case wrappedKeyLegacyVersion: throw VaultError.legacyNeedsPassword
+        default: throw VaultError.biometricsUnavailable
+        }
         let seBlob = try take(try takeU16())
         let ephPub = try take(try takeU16())
         let salt = try take(saltLength)

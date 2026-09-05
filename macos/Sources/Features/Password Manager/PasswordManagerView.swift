@@ -64,6 +64,7 @@ private struct PasswordVaultCreateView: View {
     }
 
     private func create() {
+        guard !vault.busy else { return }
         guard password == confirm else {
             error = "Passwords do not match."
             return
@@ -133,6 +134,7 @@ private struct PasswordVaultUnlockView: View {
     }
 
     private func unlock() {
+        guard !vault.busy, !password.isEmpty else { return }
         Task {
             do {
                 try await vault.unlock(masterPassword: password)
@@ -363,7 +365,7 @@ private struct PasswordListView: View {
                                     try vault.enableBiometrics()
                                 }
                             } else {
-                                vault.disableBiometrics()
+                                vault.disableBiometricsAndForget()
                             }
                         }))
                         .disabled(!vault.biometricsAvailable)
@@ -510,11 +512,16 @@ private struct ChangeMasterPasswordView: View {
     }
 
     private func change() {
+        // Exactly one operation at a time: the Change button is disabled
+        // while busy, but Return in a field is not, and a second task
+        // would take over the handle the Cancel button cancels.
+        guard task == nil, !vault.busy else { return }
         guard newPassword == confirm else {
             error = "New passwords do not match."
             return
         }
         task = Task {
+            defer { task = nil }
             do {
                 try await vault.changeMasterPassword(current: current, new: newPassword)
                 dismiss()

@@ -20,10 +20,14 @@ class PasswordManagerController: NSWindowController, NSWindowDelegate {
 
     let target = PasswordManagerTarget()
 
-    /// True while the panel is being made key. The Quick Terminal checks
-    /// this so it does not auto-hide when it loses key status to us; if
-    /// it hid, Send would land in whichever terminal was behind it.
-    private(set) var isTakingKeyWindow = false
+    /// True when the panel or one of its sheets is the key window. The
+    /// Quick Terminal checks this before auto-hiding after losing key
+    /// status: if it hid, Send would land in whichever terminal window
+    /// was behind it.
+    var ownsKeyWindow: Bool {
+        guard let window, let key = NSApp.keyWindow else { return false }
+        return key === window || key.sheetParent === window
+    }
 
     /// The surface whose password prompt auto-opened the panel. Only that
     /// surface's prompt ending closes the panel again; another terminal
@@ -54,7 +58,8 @@ class PasswordManagerController: NSWindowController, NSWindowDelegate {
                 self?.send(text, pressEnter: pressEnter)
             }))
 
-        // Keep the displayed target in step with window ordering.
+        // Keep the displayed target in step with window ordering and
+        // with the active Space.
         let center = NotificationCenter.default
         for name in [
             NSWindow.didBecomeKeyNotification,
@@ -67,6 +72,12 @@ class PasswordManagerController: NSWindowController, NSWindowDelegate {
                 self?.refreshTarget()
             })
         }
+        observers.append(NSWorkspace.shared.notificationCenter.addObserver(
+            forName: NSWorkspace.activeSpaceDidChangeNotification,
+            object: nil, queue: .main
+        ) { [weak self] _ in
+            self?.refreshTarget()
+        })
     }
 
     required init?(coder: NSCoder) {
@@ -85,9 +96,7 @@ class PasswordManagerController: NSWindowController, NSWindowDelegate {
         // reflects the terminal the user was just looking at.
         refreshTarget()
 
-        isTakingKeyWindow = true
         window.makeKeyAndOrderFront(nil)
-        isTakingKeyWindow = false
 
         // Opening a locked vault with Touch ID enabled goes straight to the
         // biometric prompt, so a password prompt in the terminal becomes:
@@ -102,13 +111,16 @@ class PasswordManagerController: NSWindowController, NSWindowDelegate {
     }
 
     /// Called when a password prompt appears (active) or goes away on a
-    /// surface. Opens the panel if the user has enabled auto-open; closes
-    /// it only when the prompt that opened it ends.
+    /// surface. Opens the panel if the user has enabled auto-open, once
+    /// per prompt: closing the panel and returning to the terminal must
+    /// not reopen it for the same prompt. Closes it only when the prompt
+    /// that opened it ends.
     func passwordPromptDetected(active: Bool, on surface: Ghostty.SurfaceView) {
         guard UserDefaults.standard.bool(forKey: "PasswordManagerAutoOpen") else { return }
 
         if active {
-            guard surface.focused else { return }
+            guard surface.focused, !surface.passwordManagerOffered else { return }
+            surface.passwordManagerOffered = true
             guard !(window?.isVisible ?? false) else { return }
             autoOpenSurface = surface
             show()
@@ -154,13 +166,17 @@ class PasswordManagerController: NSWindowController, NSWindowDelegate {
         Ghostty.moveFocus(to: surface)
     }
 
-    /// The focused surface of the frontmost visible terminal window,
-    /// panels included. `NSApp.orderedWindows` leaves panels out and the
-    /// Quick Terminal is one, so all visible windows are walked by their
-    /// z-order instead.
+    /// The focused surface of the frontmost terminal window that is
+    /// visible on the active Space, panels included. `NSApp.orderedWindows`
+    /// leaves panels out and the Quick Terminal is one, so all windows are
+    /// walked by their z-order instead. A window on another Space is
+    /// "visible" to AppKit but not to the user, so it is never a target.
     static func currentFocusedSurface() -> Ghostty.SurfaceView? {
         let terminals = NSApp.windows
-            .filter { $0.isVisible && !$0.isMiniaturized && $0.windowController is BaseTerminalController }
+            .filter {
+                $0.isVisible && $0.isOnActiveSpace && !$0.isMiniaturized &&
+                    $0.windowController is BaseTerminalController
+            }
             .sorted { $0.orderedIndex < $1.orderedIndex }
         for win in terminals {
             if let controller = win.windowController as? BaseTerminalController,

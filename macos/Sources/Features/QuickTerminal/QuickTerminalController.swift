@@ -187,42 +187,51 @@ class QuickTerminalController: BaseTerminalController {
         // when we lose focus.
         hiddenDock?.restore()
 
-        // Losing key status to the password manager panel is not the user
-        // leaving: stay on screen so the credential comes back to us
-        // instead of to whichever terminal window is behind us.
-        if PasswordManagerController.shared.isTakingKeyWindow { return }
+        guard derivedConfig.quickTerminalAutoHide else { return }
 
-        if derivedConfig.quickTerminalAutoHide {
-            switch derivedConfig.quickTerminalSpaceBehavior {
-            case .remain:
-                // If we lose focus on the active space, then we can animate out
+        // Decide whether to hide once the new key window is known, which
+        // it isn't yet while we're being told we resigned. Losing key
+        // status to the password manager panel (or one of its sheets) is
+        // not the user leaving: the credential is coming back to us, so we
+        // stay on screen instead of letting it land in whichever terminal
+        // window is behind us.
+        DispatchQueue.main.async { [weak self] in
+            guard let self, self.visible, self.window?.isKeyWindow == false else { return }
+            if PasswordManagerController.shared.ownsKeyWindow { return }
+            self.autoHideAfterLosingKey()
+        }
+    }
+
+    private func autoHideAfterLosingKey() {
+        switch derivedConfig.quickTerminalSpaceBehavior {
+        case .remain:
+            // If we lose focus on the active space, then we can animate out
+            animateOut()
+
+        case .move:
+            let currentActiveSpace = CGSSpace.active()
+            if previousActiveSpace == currentActiveSpace {
+                // We haven't moved spaces. We lost focus to another app on the
+                // current space. Animate out.
                 animateOut()
+            } else {
+                // We've moved to a different space.
 
-            case .move:
-                let currentActiveSpace = CGSSpace.active()
-                if previousActiveSpace == currentActiveSpace {
-                    // We haven't moved spaces. We lost focus to another app on the
-                    // current space. Animate out.
-                    animateOut()
-                } else {
-                    // We've moved to a different space.
-
-                    // If we're fullscreen, we need to exit fullscreen because the visible
-                    // bounds may have changed causing a new behavior.
-                    if let fullscreenStyle, fullscreenStyle.isFullscreen {
-                        fullscreenStyle.exit()
-                        DispatchQueue.main.async {
-                            self.onToggleFullscreen()
-                        }
-                    }
-
-                    // Make the window visible again on this space
+                // If we're fullscreen, we need to exit fullscreen because the visible
+                // bounds may have changed causing a new behavior.
+                if let fullscreenStyle, fullscreenStyle.isFullscreen {
+                    fullscreenStyle.exit()
                     DispatchQueue.main.async {
-                        self.window?.makeKeyAndOrderFront(nil)
+                        self.onToggleFullscreen()
                     }
-
-                    self.previousActiveSpace = currentActiveSpace
                 }
+
+                // Make the window visible again on this space
+                DispatchQueue.main.async {
+                    self.window?.makeKeyAndOrderFront(nil)
+                }
+
+                self.previousActiveSpace = currentActiveSpace
             }
         }
     }
