@@ -839,6 +839,12 @@ pub fn tryDeinit(self: *Surface) bool {
 }
 
 fn deinitImpl(self: *Surface, timeout_ns: ?u64) bool {
+    // True once the search thread was joined here; its state is then
+    // released only after the render and IO threads are gone too, since
+    // releasing it takes the terminal mutex with no timeout and the IO
+    // thread may hold that for a while (reading a graphics file, say).
+    var search_joined = false;
+
     if (timeout_ns) |t| {
         // Bounded: stop producers before their consumers, and confirm
         // each thread actually exits before joining it. The search thread
@@ -851,8 +857,7 @@ fn deinitImpl(self: *Surface, timeout_ns: ?u64) bool {
                 log.err("error notifying search thread to stop, may stall err={}", .{err});
             if (!s.state.waitForExit(t)) return self.abandon(.search);
             s.thread.join();
-            s.state.deinit();
-            self.search = null;
+            search_joined = true;
         }
 
         // Then the render thread, which the IO thread pushes into.
@@ -861,8 +866,10 @@ fn deinitImpl(self: *Surface, timeout_ns: ?u64) bool {
         if (!self.renderer_thread.waitForExit(t)) return self.abandon(.renderer);
     }
 
-    // Stop search thread (unbounded path; already stopped when bounded)
-    if (self.search) |*s| s.deinit();
+    // Stop search thread (unbounded path; joined above when bounded)
+    if (!search_joined) {
+        if (self.search) |*s| s.deinit();
+    }
 
     // Stop rendering thread
     {
@@ -884,6 +891,15 @@ fn deinitImpl(self: *Surface, timeout_ns: ?u64) bool {
             if (!self.io_thread.waitForExit(t)) return self.abandon(.io);
         }
         self.io_thr.join();
+    }
+
+    // With both threads gone nothing else can hold the terminal mutex,
+    // so the joined search thread's state can be released now.
+    if (search_joined) {
+        if (self.search) |*s| {
+            s.state.deinit();
+            self.search = null;
+        }
     }
 
     // Anything still pending was never handed to the render thread, so
@@ -3507,6 +3523,10 @@ fn tryPushRendererMessage(self: *Surface, msg: rendererpkg.Message) bool {
         );
         self.renderer_wedged = true;
     }
+
+    // Tell the render thread explicitly that something is waiting on
+    // it, so it notifies us when it drains regardless of how.
+    self.renderer_thread.recovery_wanted.store(true, .release);
     return false;
 }
 

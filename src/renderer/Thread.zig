@@ -69,6 +69,13 @@ cursor_h: xev.Timer,
 cursor_c: xev.Completion = .{},
 cursor_c_cancel: xev.Completion = .{},
 
+/// Timer used to retry the recovery notification (see `notifyRecovery`)
+/// while the app mailbox has no room for it. Nothing else is guaranteed
+/// to run this thread while a surface is idle and unfocused.
+recovery_h: xev.Timer,
+recovery_c: xev.Completion = .{},
+recovery_c_cancel: xev.Completion = .{},
+
 /// Incremental scrollback compression scheduling.
 compression: Compression = undefined,
 
@@ -96,6 +103,11 @@ exited: std.atomic.Value(bool) = .init(false),
 /// True while the surface still has to be told that this thread drained
 /// a full mailbox (see `notifyRecovery`). Only touched on this thread.
 recovery_unsent: bool = false,
+
+/// Set by a producer that could not enqueue into our mailbox in time, so
+/// the demand for reconciliation is recorded explicitly rather than
+/// inferred from how much of a batch this thread got through.
+recovery_wanted: std.atomic.Value(bool) = .init(false),
 
 /// Configuration we need derived from the main config.
 config: DerivedConfig,
@@ -163,6 +175,10 @@ pub fn init(
     var cursor_timer = try xev.Timer.init();
     errdefer cursor_timer.deinit();
 
+    // Timer for retrying the recovery notification
+    var recovery_timer = try xev.Timer.init();
+    errdefer recovery_timer.deinit();
+
     // The mailbox for messaging this thread
     var mailbox = try Mailbox.create(alloc);
     errdefer mailbox.destroy(alloc);
@@ -176,6 +192,7 @@ pub fn init(
         .render_h = render_h,
         .draw_now = draw_now,
         .cursor_h = cursor_timer,
+        .recovery_h = recovery_timer,
         .surface = surface,
         .renderer = renderer_impl,
         .state = state,
@@ -200,6 +217,7 @@ pub fn deinit(self: *Thread) void {
     self.render_h.deinit();
     self.draw_now.deinit();
     self.cursor_h.deinit();
+    self.recovery_h.deinit();
     if (comptime terminalpkg.compression_enabled)
         self.compression.deinit();
     self.loop.deinit();
@@ -333,8 +351,18 @@ fn drainMailbox(self: *Thread) !void {
         void;
     defer if (builtin.os.tag.isDarwin()) pool.deinit();
 
+    // Note the need for reconciliation up front, independently of how
+    // much of this batch we get through (a handler may fail partway):
+    // either a producer told us it could not enqueue, or the mailbox is
+    // full right now, which means producers waited or gave up on it.
+    if (self.recovery_wanted.swap(false, .acq_rel) or
+        self.mailbox.count(global.io()) >= mailbox_capacity)
+    {
+        self.recovery_unsent = true;
+    }
+
     var drained: usize = 0;
-    // Runs even if a handler fails partway, so the count is never lost.
+    // Runs even if a handler fails partway.
     defer self.notifyRecovery(drained);
     while (self.mailbox.pop(global.io())) |message| {
         drained += 1;
@@ -480,18 +508,80 @@ fn drainMailbox(self: *Thread) !void {
     }
 }
 
+/// How often to retry the recovery notification while the app mailbox
+/// has no room for it.
+const recovery_retry_ms: u64 = 250;
+
 /// A full mailbox means app-side producers timed out or blocked on us
 /// (see Surface.pushRendererMessage). Once there is room again the
 /// surface must be told so it can deliver what it deferred. The
 /// notification is never blocking (that would be a new way to wedge),
 /// so if the app mailbox happens to be full it is remembered and retried
-/// on every later drain and render tick until it gets through.
+/// on later drains, render ticks, and a timer, until it gets through.
+/// The timer matters for an idle, unfocused surface, which nothing else
+/// is guaranteed to run this thread for.
 fn notifyRecovery(self: *Thread, drained: usize) void {
     if (drained >= mailbox_capacity) self.recovery_unsent = true;
     if (!self.recovery_unsent) return;
+    if (self.pushRecovery()) return;
+
+    if (self.recovery_c.state() == .active) {
+        self.recovery_h.reset(
+            &self.loop,
+            &self.recovery_c,
+            &self.recovery_c_cancel,
+            recovery_retry_ms,
+            Thread,
+            self,
+            recoveryTimerCallback,
+        );
+    } else {
+        self.recovery_h.run(
+            &self.loop,
+            &self.recovery_c,
+            recovery_retry_ms,
+            Thread,
+            self,
+            recoveryTimerCallback,
+        );
+    }
+}
+
+/// One non-blocking attempt to deliver the recovery notification.
+fn pushRecovery(self: *Thread) bool {
     if (self.renderer.surface_mailbox.push(.{ .renderer_recovered = {} }, .instant) > 0) {
         self.recovery_unsent = false;
+        return true;
     }
+    return false;
+}
+
+fn recoveryTimerCallback(
+    self_: ?*Thread,
+    _: *xev.Loop,
+    _: *xev.Completion,
+    r: xev.Timer.RunError!void,
+) xev.CallbackAction {
+    _ = r catch |err| switch (err) {
+        error.Canceled => return .disarm,
+        else => {
+            log.warn("error in recovery timer callback err={}", .{err});
+            unreachable;
+        },
+    };
+    const t: *Thread = self_ orelse return .disarm;
+
+    if (t.recovery_unsent and !t.pushRecovery()) {
+        t.recovery_h.run(
+            &t.loop,
+            &t.recovery_c,
+            recovery_retry_ms,
+            Thread,
+            t,
+            recoveryTimerCallback,
+        );
+    }
+    return .disarm;
 }
 
 fn changeConfig(self: *Thread, config: *const DerivedConfig) !void {

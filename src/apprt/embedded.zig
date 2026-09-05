@@ -152,6 +152,12 @@ pub const App = struct {
     /// wake us up, and must hit this gate instead of a dead host.
     terminated: std.atomic.Value(bool) = .init(false),
 
+    /// Synchronizes callback admission with `ghostty_app_free`: callers
+    /// hold it shared across the check of `terminated` and the callback
+    /// itself, and free takes it exclusively while closing the gate, so
+    /// once free proceeds no callback is in flight and none can start.
+    callback_gate: std.Io.RwLock = .init,
+
     /// The configuration for the app. This is owned by this structure.
     config: Config,
 
@@ -272,7 +278,9 @@ pub const App = struct {
         return input.KeyboardLayout.mapAppleId(id) orelse .unknown;
     }
 
-    pub fn wakeup(self: *const App) void {
+    pub fn wakeup(self: *App) void {
+        self.callback_gate.lockSharedUncancelable(global.io());
+        defer self.callback_gate.unlockShared(global.io());
         if (self.terminated.load(.acquire)) return;
         self.opts.wakeup(self.opts.userdata);
     }
@@ -1732,21 +1740,28 @@ pub const CAPI = struct {
     export fn ghostty_app_free(v: *App) void {
         const core_app = v.core_app;
 
-        // If a surface was abandoned with live threads (see
-        // Surface.tryDeinit), those threads can still push into the app
-        // mailbox and call back into us to wake the host. Close the gate
-        // before anything is torn down, and keep this struct (and the
-        // core app, which leaks itself) so the gate stays readable.
+        // Close callback admission first, synchronized with any worker
+        // that is mid-wakeup: once the exclusive lock is ours no callback
+        // is in flight and none can start, so the host may go away.
+        v.callback_gate.lockUncancelable(global.io());
+        v.terminated.store(true, .release);
+        v.callback_gate.unlock(global.io());
+
+        // Tear down the surfaces while the embedded app they reference is
+        // still valid. Any of them may be abandoned with live threads
+        // here (see Surface.tryDeinit).
+        core_app.deinit();
+        v.terminate();
+
+        // Abandoned workers can still reach both app structs (the gate,
+        // the mailbox); keep them.
         if (core_app.leaked_surfaces > 0) {
-            v.terminated.store(true, .release);
-            v.terminate();
-            core_app.destroy();
+            log.warn("leaking app structs: {d} surface(s) abandoned", .{core_app.leaked_surfaces});
             return;
         }
 
-        v.terminate();
         global.alloc().destroy(v);
-        core_app.destroy();
+        core_app.alloc.destroy(core_app);
     }
 
     /// Update the focused state of the app.

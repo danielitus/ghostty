@@ -147,6 +147,14 @@ pub fn BlockingQueue(
         }
 
         /// Pop a value from the queue without blocking.
+        /// Number of queued values right now. Only a snapshot: it can
+        /// change as soon as the lock is released.
+        pub fn count(self: *Self, io: std.Io) Size {
+            self.mutex.lockUncancelable(io);
+            defer self.mutex.unlock(io);
+            return self.len;
+        }
+
         pub fn pop(self: *Self, io: std.Io) ?T {
             self.mutex.lockUncancelable(io);
             defer self.mutex.unlock(io);
