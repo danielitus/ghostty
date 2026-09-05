@@ -365,7 +365,9 @@ private struct PasswordListView: View {
                                     try vault.enableBiometrics()
                                 }
                             } else {
-                                vault.disableBiometricsAndForget()
+                                perform(title: "Couldn't Turn Off Touch ID") {
+                                    try vault.disableBiometricsAndForget()
+                                }
                             }
                         }))
                         .disabled(!vault.biometricsAvailable)

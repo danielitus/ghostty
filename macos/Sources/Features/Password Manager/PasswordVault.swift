@@ -275,11 +275,20 @@ class PasswordVault: ObservableObject {
         // failure; the next save upgrades the file anyway.
         if file.version < Self.version {
             upgradeLegacyVault()
-        } else if biometricsEnabled && !Self.isCurrentWrappedKey(wrappedKeyData) {
-            // Touch ID is on but its wrapper is missing or in the old
-            // format (a build downgrade, a partial upgrade); a password
-            // unlock is the one place a fresh one can be made safely.
-            repairWrappedKey()
+        } else if biometricsEnabled {
+            // Touch ID is on but its wrapper is confirmed missing or in
+            // the old format (a build downgrade, a partial upgrade); a
+            // password unlock is the one place a fresh one can be made
+            // safely. A wrapper that merely couldn't be read right now is
+            // left alone.
+            switch wrappedKeyData {
+            case .absent:
+                repairWrappedKey()
+            case .present(let data) where !Self.isCurrentWrappedKey(data):
+                repairWrappedKey()
+            case .present, .unreadable:
+                break
+            }
         }
     }
 
@@ -335,7 +344,20 @@ class PasswordVault: ObservableObject {
 
         // One shared-lock snapshot of both files, so the wrapper we
         // authenticate against belongs to the vault we then open.
-        let (file, wrappedKeyData) = try Self.readVaultFiles()
+        let (file, wrappedKeyRead) = try Self.readVaultFiles()
+
+        let wrappedKeyData: Data
+        switch wrappedKeyRead {
+        case .present(let data):
+            wrappedKeyData = data
+        case .absent:
+            // Nothing to use: confirmed. There is no file to delete.
+            if generation == self.generation { disableBiometrics(deleteWrappedKeyMatching: nil) }
+            throw VaultError.biometricsUnavailable
+        case .unreadable(let error):
+            // May be transient (I/O error, permissions): report, keep the setup.
+            throw VaultError.biometricsFailed(Self.describe(error))
+        }
 
         // A pre-v3 vault has an unauthenticated header. Opening it with a
         // key that bypasses the KDF would let a tampered iteration count
@@ -406,6 +428,12 @@ class PasswordVault: ObservableObject {
     func reloadFromDisk() throws {
         guard state == .unlocked, let key else { throw VaultError.locked }
         let file = try Self.readVaultFile()
+        // A pre-v3 file (a restored backup, say) has an unauthenticated
+        // header; only a master-password unlock may adopt its metadata.
+        guard file.version >= Self.version else {
+            lock()
+            throw VaultError.legacyNeedsPassword
+        }
         do {
             let decoded = try Self.open(file, using: key)
             adopt(file: file, key: key, entries: decoded)
@@ -437,14 +465,18 @@ class PasswordVault: ObservableObject {
     /// `deleteWrappedKeyMatching` is the exact content that was found to be
     /// unusable; passing nil keeps whatever is on disk.
     func disableBiometrics(deleteWrappedKeyMatching stale: Data? = nil) {
-        if let stale { Self.deleteWrappedKey(matching: stale) }
+        // Best effort: this runs on error paths where the wrapper was
+        // found unusable, so failing to remove it costs nothing.
+        if let stale { try? Self.deleteWrappedKey(matching: stale) }
         UserDefaults.standard.set(false, forKey: Self.biometricsDefaultsKey)
         biometricsEnabled = false
     }
 
-    /// Turn Touch ID off from the UI, removing the wrapped key.
-    func disableBiometricsAndForget() {
-        Self.deleteWrappedKey(matching: nil)
+    /// Turn Touch ID off from the UI, removing the wrapped key. Throws,
+    /// and leaves Touch ID on, if the key could not be removed: a still
+    /// usable wrapper must never be presented as forgotten.
+    func disableBiometricsAndForget() throws {
+        try Self.deleteWrappedKey(matching: nil)
         UserDefaults.standard.set(false, forKey: Self.biometricsDefaultsKey)
         biometricsEnabled = false
     }
@@ -770,19 +802,29 @@ class PasswordVault: ObservableObject {
         try readVaultFiles().vault
     }
 
-    /// Read the vault and, if present, the Touch ID wrapper under one
-    /// shared lock, so the two always come from the same point in time.
-    nonisolated private static func readVaultFiles() throws -> (vault: VaultFile, wrappedKey: Data?) {
+    /// What was found where the Touch ID wrapper lives. Absent and
+    /// unreadable are kept apart: only the former is confirmed dead.
+    private enum WrappedKeyRead {
+        case absent
+        case unreadable(Error)
+        case present(Data)
+    }
+
+    /// Read the vault and the Touch ID wrapper under one shared lock, so
+    /// the two always come from the same point in time.
+    nonisolated private static func readVaultFiles() throws -> (vault: VaultFile, wrappedKey: WrappedKeyRead) {
         let lock = try VaultLock.acquire(exclusive: false)
         defer { lock.release() }
 
-        let wrappedKey: Data?
+        let wrappedKey: WrappedKeyRead
         do {
-            wrappedKey = try readIfExists(wrappedKeyURL)
+            if let data = try readIfExists(wrappedKeyURL) {
+                wrappedKey = .present(data)
+            } else {
+                wrappedKey = .absent
+            }
         } catch {
-            // A wrapper that can't be read right now is treated as absent
-            // by the caller; that is never destructive.
-            wrappedKey = nil
+            wrappedKey = .unreadable(error)
         }
 
         let data = try Data(contentsOf: fileURL)
@@ -945,13 +987,12 @@ class PasswordVault: ObservableObject {
     /// Remove the wrapped key file. With `matching` set, only a file whose
     /// contents are exactly those bytes is removed, so a wrapper another
     /// instance installed in the meantime is never deleted by mistake.
-    nonisolated private static func deleteWrappedKey(matching stale: Data?) {
-        guard let lock = try? VaultLock.acquire(exclusive: true) else { return }
+    nonisolated private static func deleteWrappedKey(matching stale: Data?) throws {
+        let lock = try VaultLock.acquire(exclusive: true)
         defer { lock.release() }
-        if let stale {
-            guard let current = try? readIfExists(wrappedKeyURL), current == stale else { return }
-        }
-        try? FileManager.default.removeItem(at: wrappedKeyURL)
+        guard let current = try readIfExists(wrappedKeyURL) else { return }
+        if let stale, current != stale { return }
+        try FileManager.default.removeItem(at: wrappedKeyURL)
     }
 
     /// Unwraps the vault key; the Secure Enclave operation presents the
@@ -959,13 +1000,10 @@ class PasswordVault: ObservableObject {
     /// user responds. Errors are classified so callers can tell a dead
     /// setup from a transient failure; see `VaultError`.
     @concurrent nonisolated private static func unwrapKey(
-        _ wrappedKeyData: Data?,
+        _ data: Data,
         context box: AuthContextBox,
         vaultSalt: Data
     ) async throws -> SymmetricKey {
-        // Nothing to use: confirmed.
-        guard let data = wrappedKeyData else { throw VaultError.biometricsUnavailable }
-
         // Parse; a malformed file is confirmed unusable, not transient.
         var offset = 0
         func take(_ n: Int) throws -> Data {

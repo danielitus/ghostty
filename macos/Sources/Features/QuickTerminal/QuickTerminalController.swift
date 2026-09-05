@@ -101,6 +101,7 @@ class QuickTerminalController: BaseTerminalController {
         // Remove all of our notificationcenter subscriptions
         let center = NotificationCenter.default
         center.removeObserver(self)
+        for observer in passwordPanelFocusObservers { center.removeObserver(observer) }
 
         // Make sure we restore our hidden dock
         hiddenDock = nil
@@ -197,9 +198,57 @@ class QuickTerminalController: BaseTerminalController {
         // window is behind us.
         DispatchQueue.main.async { [weak self] in
             guard let self, self.visible, self.window?.isKeyWindow == false else { return }
-            if PasswordManagerController.shared.ownsKeyWindow { return }
+            if PasswordManagerController.shared.ownsKeyWindow {
+                // Deferred, not forgotten: hide once focus moves on from
+                // the manager to anywhere other than us.
+                self.watchForFocusLeavingPasswordPanel()
+                return
+            }
             self.autoHideAfterLosingKey()
         }
+    }
+
+    /// Observers installed while auto-hide is deferred because the
+    /// password manager took key status. We are not key ourselves then,
+    /// so no further windowDidResignKey reaches us; these watch the next
+    /// key transition instead.
+    private var passwordPanelFocusObservers: [NSObjectProtocol] = []
+
+    private func watchForFocusLeavingPasswordPanel() {
+        guard passwordPanelFocusObservers.isEmpty else { return }
+        let center = NotificationCenter.default
+        for name in [
+            NSWindow.didBecomeKeyNotification,
+            NSWindow.didResignKeyNotification,
+            NSApplication.didResignActiveNotification,
+        ] {
+            passwordPanelFocusObservers.append(center.addObserver(
+                forName: name, object: nil, queue: .main
+            ) { [weak self] _ in
+                DispatchQueue.main.async { self?.reevaluateDeferredAutoHide() }
+            })
+        }
+    }
+
+    private func stopWatchingPasswordPanel() {
+        for observer in passwordPanelFocusObservers {
+            NotificationCenter.default.removeObserver(observer)
+        }
+        passwordPanelFocusObservers.removeAll()
+    }
+
+    private func reevaluateDeferredAutoHide() {
+        // Focus came back to us: the normal resign-key path applies again.
+        if window?.isKeyWindow == true {
+            stopWatchingPasswordPanel()
+            return
+        }
+        // Still on the manager (or one of its sheets): keep waiting.
+        if PasswordManagerController.shared.ownsKeyWindow { return }
+        // Focus went somewhere else: this is the hide we deferred.
+        stopWatchingPasswordPanel()
+        guard visible, derivedConfig.quickTerminalAutoHide else { return }
+        autoHideAfterLosingKey()
     }
 
     private func autoHideAfterLosingKey() {
