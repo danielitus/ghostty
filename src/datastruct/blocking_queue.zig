@@ -71,6 +71,11 @@ pub fn BlockingQueue(
         cond_not_full: std.Io.Condition = .init,
         not_full_waiters: usize = 0,
 
+        /// Set whenever a push failed because the queue was full, until
+        /// the consumer clears it with `takeOverflowed`. Lets a consumer
+        /// learn that producers gave up on it, whoever they were.
+        overflowed: bool = false,
+
         /// Allocate the blocking queue on the heap.
         pub fn create(alloc: Allocator) Allocator.Error!*Self {
             const ptr = try alloc.create(Self);
@@ -107,7 +112,7 @@ pub fn BlockingQueue(
             if (self.full()) {
                 switch (timeout) {
                     // If we're not waiting, then we failed to write.
-                    .instant => return 0,
+                    .instant => return self.dropped(),
 
                     .forever => {
                         self.not_full_waiters += 1;
@@ -128,13 +133,13 @@ pub fn BlockingQueue(
                                     .clock = .awake,
                                 },
                             },
-                        ) catch return 0;
+                        ) catch return self.dropped();
                     },
                 }
 
                 // If we're still full, then we failed to write. This can
                 // happen in situations where we are interrupted.
-                if (self.full()) return 0;
+                if (self.full()) return self.dropped();
             }
 
             // Add our data and update our accounting
@@ -147,6 +152,22 @@ pub fn BlockingQueue(
         }
 
         /// Pop a value from the queue without blocking.
+        /// Record a failed push. Must be called with the mutex held.
+        fn dropped(self: *Self) Size {
+            self.overflowed = true;
+            return 0;
+        }
+
+        /// Returns whether any push failed since the last call, and
+        /// clears the flag.
+        pub fn takeOverflowed(self: *Self, io: std.Io) bool {
+            self.mutex.lockUncancelable(io);
+            defer self.mutex.unlock(io);
+            const result = self.overflowed;
+            self.overflowed = false;
+            return result;
+        }
+
         /// Number of queued values right now. Only a snapshot: it can
         /// change as soon as the lock is released.
         pub fn count(self: *Self, io: std.Io) Size {

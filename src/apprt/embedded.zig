@@ -1747,9 +1747,15 @@ pub const CAPI = struct {
         v.terminated.store(true, .release);
         v.callback_gate.unlock(global.io());
 
-        // Tear down the surfaces while the embedded app they reference is
-        // still valid. Any of them may be abandoned with live threads
-        // here (see Surface.tryDeinit).
+        // Tear down any surfaces still registered while the embedded app
+        // they reference is still valid, one at a time from the end:
+        // each teardown removes itself from the list, so iterating the
+        // list would invalidate the iterator. A surface abandoned with
+        // live threads (see Surface.tryDeinit) is removed but not freed.
+        while (core_app.surfaces.items.len > 0) {
+            const last = core_app.surfaces.items[core_app.surfaces.items.len - 1];
+            v.closeSurface(last);
+        }
         core_app.deinit();
         v.terminate();
 

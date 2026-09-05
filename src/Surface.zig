@@ -3523,10 +3523,8 @@ fn tryPushRendererMessage(self: *Surface, msg: rendererpkg.Message) bool {
         );
         self.renderer_wedged = true;
     }
-
-    // Tell the render thread explicitly that something is waiting on
-    // it, so it notifies us when it drains regardless of how.
-    self.renderer_thread.recovery_wanted.store(true, .release);
+    // The mailbox itself records the failed push; the render thread
+    // notifies us when it drains, whichever thread's push it was.
     return false;
 }
 

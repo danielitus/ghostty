@@ -531,9 +531,9 @@ pub fn resize(
     // Mail the renderer so that it can update the GPU and re-render.
     // Bounded: a wedged render thread must not take the IO thread down
     // with it, since app-thread IO pushes would then block too. A
-    // dropped resize is repaired by the next one, or by the surface
-    // re-sending its size when the render thread recovers (see
-    // Surface.rendererRecovered).
+    // dropped resize is recorded by the mailbox and repaired by the
+    // surface re-sending its size once the render thread recovers (see
+    // Surface.rendererRecovered), or by the next resize.
     if (self.renderer_mailbox.push(
         global.io(),
         .{ .resize = size },

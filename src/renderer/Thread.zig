@@ -104,11 +104,6 @@ exited: std.atomic.Value(bool) = .init(false),
 /// a full mailbox (see `notifyRecovery`). Only touched on this thread.
 recovery_unsent: bool = false,
 
-/// Set by a producer that could not enqueue into our mailbox in time, so
-/// the demand for reconciliation is recorded explicitly rather than
-/// inferred from how much of a batch this thread got through.
-recovery_wanted: std.atomic.Value(bool) = .init(false),
-
 /// Configuration we need derived from the main config.
 config: DerivedConfig,
 
@@ -353,9 +348,9 @@ fn drainMailbox(self: *Thread) !void {
 
     // Note the need for reconciliation up front, independently of how
     // much of this batch we get through (a handler may fail partway):
-    // either a producer told us it could not enqueue, or the mailbox is
-    // full right now, which means producers waited or gave up on it.
-    if (self.recovery_wanted.swap(false, .acq_rel) or
+    // either some producer, whichever thread it was on, gave up on a
+    // push because we were full, or the mailbox is full right now.
+    if (self.mailbox.takeOverflowed(global.io()) or
         self.mailbox.count(global.io()) >= mailbox_capacity)
     {
         self.recovery_unsent = true;
