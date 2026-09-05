@@ -187,6 +187,11 @@ class QuickTerminalController: BaseTerminalController {
         // when we lose focus.
         hiddenDock?.restore()
 
+        // Losing key status to the password manager panel is not the user
+        // leaving: stay on screen so the credential comes back to us
+        // instead of to whichever terminal window is behind us.
+        if PasswordManagerController.shared.isTakingKeyWindow { return }
+
         if derivedConfig.quickTerminalAutoHide {
             switch derivedConfig.quickTerminalSpaceBehavior {
             case .remain:

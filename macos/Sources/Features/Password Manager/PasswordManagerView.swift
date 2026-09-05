@@ -2,19 +2,28 @@ import SwiftUI
 
 struct PasswordManagerView: View {
     @ObservedObject var vault: PasswordVault = .shared
+    @ObservedObject var target: PasswordManagerTarget
 
-    /// Called with the text to type into the focused terminal surface.
-    var onSend: (String) -> Void
+    /// Called with the text to type into the target terminal surface and
+    /// whether to press Enter afterwards.
+    var onSend: (String, Bool) -> Void
 
     var body: some View {
-        switch vault.state {
-        case .uninitialized:
-            PasswordVaultCreateView(vault: vault)
-        case .locked:
-            PasswordVaultUnlockView(vault: vault)
-        case .unlocked:
-            PasswordListView(vault: vault, onSend: onSend)
+        Group {
+            switch vault.state {
+            case .uninitialized:
+                PasswordVaultCreateView(vault: vault)
+            case .locked:
+                PasswordVaultUnlockView(vault: vault)
+            case .unlocked:
+                PasswordListView(vault: vault, target: target, onSend: onSend)
+            }
         }
+        // Every lock() bumps the epoch. Keying the whole tree on it throws
+        // away typed master passwords, entry drafts, and open sheets on
+        // each lock, even when the vault state did not change (locking a
+        // vault that was already locked used to keep the typed password).
+        .id(vault.lockEpoch)
     }
 }
 
@@ -92,7 +101,10 @@ private struct PasswordVaultUnlockView: View {
                 .onSubmit(unlock)
 
             if let error {
-                Text(error).font(.caption).foregroundStyle(.red)
+                Text(error)
+                    .font(.caption)
+                    .foregroundStyle(.red)
+                    .multilineTextAlignment(.center)
             }
 
             HStack {
@@ -155,7 +167,8 @@ private struct PasswordVaultUnlockView: View {
 
 private struct PasswordListView: View {
     @ObservedObject var vault: PasswordVault
-    var onSend: (String) -> Void
+    @ObservedObject var target: PasswordManagerTarget
+    var onSend: (String, Bool) -> Void
 
     @State private var search = ""
     @State private var selection: UUID?
@@ -167,7 +180,15 @@ private struct PasswordListView: View {
     @State private var lockOnClose = UserDefaults.standard.bool(
         forKey: "PasswordManagerLockOnClose")
     @State private var changingPassword = false
-    @State private var touchIDError: String?
+    @State private var alert: AlertInfo?
+
+    private struct AlertInfo: Identifiable {
+        let id = UUID()
+        let title: String
+        let message: String
+        /// The vault changed on disk; offer to reload it.
+        let stale: Bool
+    }
 
     private var filtered: [PasswordEntry] {
         guard !search.isEmpty else { return vault.entries }
@@ -243,17 +264,18 @@ private struct PasswordListView: View {
                         .tag(entry.id)
                         .contextMenu {
                             Button("Send Password") { send(entry.password) }
+                                .disabled(target.title == nil)
                             Button("Send Username") { send(entry.username) }
-                                .disabled(entry.username.isEmpty)
+                                .disabled(entry.username.isEmpty || target.title == nil)
                             Divider()
-                            Button("Move Up") { try? vault.move(entry, by: -1) }
+                            Button("Move Up") { perform { try vault.move(entry, by: -1) } }
                                 .disabled(!search.isEmpty || vault.entries.first?.id == entry.id)
-                            Button("Move Down") { try? vault.move(entry, by: 1) }
+                            Button("Move Down") { perform { try vault.move(entry, by: 1) } }
                                 .disabled(!search.isEmpty || vault.entries.last?.id == entry.id)
                             Divider()
                             Button("Edit…") { editing = entry }
                             Button("Delete", role: .destructive) {
-                                try? vault.delete(entry)
+                                perform { try vault.delete(entry) }
                             }
                         }
                     }
@@ -262,7 +284,7 @@ private struct PasswordListView: View {
                     // vault, so reordering is disabled while searching.
                     .onMove { source, destination in
                         guard search.isEmpty else { return }
-                        try? vault.move(fromOffsets: source, toOffset: destination)
+                        perform { try vault.move(fromOffsets: source, toOffset: destination) }
                     }
                 }
                 .listStyle(.inset)
@@ -270,17 +292,34 @@ private struct PasswordListView: View {
 
             Divider()
 
-            HStack(spacing: 8) {
-                Button("Send Username") { send(selected?.username) }
-                    .disabled(selected?.username.isEmpty ?? true)
-                Button("Send Password") { send(selected?.password) }
-                    .buttonStyle(.borderedProminent)
-                    .disabled(selected == nil)
-                    .keyboardShortcut(.defaultAction)
+            VStack(spacing: 6) {
+                HStack(spacing: 8) {
+                    Button("Send Username") { send(selected?.username) }
+                        .disabled(selected?.username.isEmpty ?? true || target.title == nil)
+                    Button("Send Password") { send(selected?.password) }
+                        .buttonStyle(.borderedProminent)
+                        .disabled(selected == nil || target.title == nil)
+                        .keyboardShortcut(.defaultAction)
+                }
+                .controlSize(.large)
+
+                // Where the credential will be typed, resolved live so it
+                // always matches what Send would do right now.
+                if let title = target.title {
+                    Text("Sends to \u{201C}\(title)\u{201D}")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                        .lineLimit(1)
+                        .truncationMode(.middle)
+                } else {
+                    Text("No terminal window to send to")
+                        .font(.caption)
+                        .foregroundStyle(.red)
+                }
             }
-            .controlSize(.large)
             .frame(maxWidth: .infinity)
-            .padding(.vertical, 10)
+            .padding(.vertical, 8)
+            .padding(.horizontal, 10)
 
             Divider()
 
@@ -301,7 +340,7 @@ private struct PasswordListView: View {
                 .disabled(selected == nil)
                 .help("Edit entry")
                 Button {
-                    if let selected { try? vault.delete(selected) }
+                    if let selected { perform { try vault.delete(selected) } }
                 } label: {
                     Image(systemName: "minus")
                         .frame(width: 20, height: 20)
@@ -320,10 +359,8 @@ private struct PasswordListView: View {
                         get: { vault.biometricsEnabled },
                         set: { on in
                             if on {
-                                do {
+                                perform(title: "Couldn't Enable Touch ID") {
                                     try vault.enableBiometrics()
-                                } catch {
-                                    touchIDError = error.localizedDescription
                                 }
                             } else {
                                 vault.disableBiometrics()
@@ -359,22 +396,33 @@ private struct PasswordListView: View {
                 UserDefaults.standard.set(v, forKey: "PasswordManagerLockOnClose")
             }
         }
-        .frame(width: 340, height: 420)
+        .frame(width: 340, height: 440)
         .onAppear { selectFirstIfNeeded() }
         .onChange(of: search) { _ in selectFirstIfNeeded() }
+        // Keep a valid selection across adds, deletes, and reorders too,
+        // not just searches: the first entry added to an empty vault is
+        // selected, and deleting the selected entry selects a neighbor.
+        .onChange(of: filtered.map(\.id)) { _ in selectFirstIfNeeded() }
         .sheet(item: $editing) { entry in
             PasswordEntryEditView(vault: vault, entry: entry)
         }
         .sheet(isPresented: $changingPassword) {
             ChangeMasterPasswordView(vault: vault)
         }
-        .alert("Couldn't Enable Touch ID", isPresented: Binding(
-            get: { touchIDError != nil },
-            set: { if !$0 { touchIDError = nil } })
-        ) {
-            Button("OK", role: .cancel) {}
-        } message: {
-            Text(touchIDError ?? "")
+        .alert(item: $alert) { info in
+            if info.stale {
+                return Alert(
+                    title: Text(info.title),
+                    message: Text(info.message),
+                    primaryButton: .default(Text("Reload")) {
+                        perform(title: "Couldn't Reload") { try vault.reloadFromDisk() }
+                    },
+                    secondaryButton: .cancel())
+            }
+            return Alert(
+                title: Text(info.title),
+                message: Text(info.message),
+                dismissButton: .default(Text("OK")))
         }
     }
 
@@ -382,16 +430,36 @@ private struct PasswordListView: View {
         if selected == nil { selection = filtered.first?.id }
     }
 
+    /// Run a vault mutation and surface its failure instead of hiding it;
+    /// the vault only publishes changes that were written, so a failure
+    /// here means nothing changed.
+    private func perform(title: String = "Couldn't Save", _ action: () throws -> Void) {
+        do {
+            try action()
+        } catch {
+            let stale: Bool
+            if case PasswordVault.VaultError.staleVault? = error as? PasswordVault.VaultError {
+                stale = true
+            } else {
+                stale = false
+            }
+            alert = AlertInfo(title: title, message: error.localizedDescription, stale: stale)
+        }
+    }
+
     private func send(_ text: String?) {
         guard let text, !text.isEmpty else { return }
         // Strip control characters so a stored value can never inject key
-        // presses beyond the credential itself; Enter is appended only via
-        // the explicit toggle below.
+        // presses beyond the credential itself. Enter, when enabled, is
+        // sent by the controller as a real key event rather than as a
+        // carriage return inside the text: the text goes through the paste
+        // path, and inside a bracketed paste a "\r" is inserted literally
+        // instead of submitting.
         let clean = String(text.unicodeScalars.filter {
             $0.value >= 0x20 && !(0x7F...0x9F).contains($0.value)
         })
         guard !clean.isEmpty else { return }
-        onSend(pressEnter ? clean + "\r" : clean)
+        onSend(clean, pressEnter)
     }
 }
 
@@ -403,6 +471,7 @@ private struct ChangeMasterPasswordView: View {
     @State private var newPassword = ""
     @State private var confirm = ""
     @State private var error: String?
+    @State private var task: Task<Void, Never>?
     @Environment(\.dismiss) private var dismiss
 
     var body: some View {
@@ -422,8 +491,13 @@ private struct ChangeMasterPasswordView: View {
             }
 
             HStack {
-                Button("Cancel") { dismiss() }
-                    .keyboardShortcut(.cancelAction)
+                Button("Cancel") {
+                    // Cancelling really cancels: the vault checks for
+                    // cancellation before it commits the new password.
+                    task?.cancel()
+                    dismiss()
+                }
+                .keyboardShortcut(.cancelAction)
                 Spacer()
                 Button("Change", action: change)
                     .keyboardShortcut(.defaultAction)
@@ -432,6 +506,7 @@ private struct ChangeMasterPasswordView: View {
         }
         .padding(16)
         .frame(width: 320)
+        .onDisappear { task?.cancel() }
     }
 
     private func change() {
@@ -439,7 +514,7 @@ private struct ChangeMasterPasswordView: View {
             error = "New passwords do not match."
             return
         }
-        Task {
+        task = Task {
             do {
                 try await vault.changeMasterPassword(current: current, new: newPassword)
                 dismiss()
@@ -459,6 +534,7 @@ private struct PasswordEntryEditView: View {
     @ObservedObject var vault: PasswordVault
     @State var entry: PasswordEntry
     @State private var showPassword = false
+    @State private var error: String?
     @Environment(\.dismiss) private var dismiss
 
     private var isNew: Bool {
@@ -488,23 +564,37 @@ private struct PasswordEntryEditView: View {
                 }
             }
 
+            if let error {
+                Text(error)
+                    .font(.caption)
+                    .foregroundStyle(.red)
+                    .multilineTextAlignment(.center)
+            }
+
             HStack {
                 Button("Cancel") { dismiss() }
                     .keyboardShortcut(.cancelAction)
                 Spacer()
-                Button("Save") {
-                    if isNew {
-                        try? vault.add(entry)
-                    } else {
-                        try? vault.update(entry)
-                    }
-                    dismiss()
-                }
-                .keyboardShortcut(.defaultAction)
-                .disabled(entry.label.isEmpty)
+                Button("Save", action: save)
+                    .keyboardShortcut(.defaultAction)
+                    .disabled(entry.label.isEmpty)
             }
         }
         .padding(16)
         .frame(width: 320)
+    }
+
+    private func save() {
+        do {
+            if isNew {
+                try vault.add(entry)
+            } else {
+                try vault.update(entry)
+            }
+            dismiss()
+        } catch {
+            // Keep the sheet open so nothing typed is lost.
+            self.error = error.localizedDescription
+        }
     }
 }

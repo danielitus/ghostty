@@ -143,9 +143,11 @@ extension Ghostty {
 
                 // Offer the password manager when a password prompt is
                 // detected on the focused surface (opt-in via its toggle).
+                // The controller ignores a prompt ending on any surface
+                // other than the one that opened the panel.
                 if focused || !passwordInput {
                     PasswordManagerController.shared.passwordPromptDetected(
-                        active: passwordInput)
+                        active: passwordInput, on: self)
                 }
             }
         }
@@ -463,6 +465,14 @@ extension Ghostty {
 
             // Notify libghostty
             ghostty_surface_set_focus(surface, focused)
+
+            // A password prompt that was already active when this surface
+            // gained focus never re-fires passwordInput's setter, so offer
+            // the password manager from here.
+            if focused && passwordInput {
+                PasswordManagerController.shared.passwordPromptDetected(
+                    active: true, on: self)
+            }
 
             // Update our secure input state if we are a password input
             if passwordInput {
