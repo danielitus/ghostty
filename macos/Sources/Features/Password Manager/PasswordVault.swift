@@ -990,9 +990,21 @@ class PasswordVault: ObservableObject {
     nonisolated private static func deleteWrappedKey(matching stale: Data?) throws {
         let lock = try VaultLock.acquire(exclusive: true)
         defer { lock.release() }
-        guard let current = try readIfExists(wrappedKeyURL) else { return }
-        if let stale, current != stale { return }
-        try FileManager.default.removeItem(at: wrappedKeyURL)
+        if let stale {
+            // Conditional: only the exact bytes found unusable go.
+            guard let current = try readIfExists(wrappedKeyURL) else { return }
+            if current != stale { return }
+        }
+        // Unconditional removal needs no read: an unreadable but removable
+        // file must still be forgettable. Absence is success.
+        do {
+            try FileManager.default.removeItem(at: wrappedKeyURL)
+        } catch let error as CocoaError where error.code == .fileNoSuchFile {
+            return
+        } catch let error as NSError
+            where error.domain == NSPOSIXErrorDomain && error.code == Int(ENOENT) {
+            return
+        }
     }
 
     /// Unwraps the vault key; the Secure Enclave operation presents the

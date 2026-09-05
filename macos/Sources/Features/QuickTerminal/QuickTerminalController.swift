@@ -214,8 +214,18 @@ class QuickTerminalController: BaseTerminalController {
     /// key transition instead.
     private var passwordPanelFocusObservers: [NSObjectProtocol] = []
 
+    /// Bumped whenever a deferred-hide session ends, so re-evaluations
+    /// queued during that session are discarded rather than acting on a
+    /// decision that was already made.
+    private var deferredHideGeneration = 0
+
+    /// True while a re-evaluation is queued and not yet run; several
+    /// notifications in one turn produce a single re-evaluation.
+    private var deferredHideReevaluationQueued = false
+
     private func watchForFocusLeavingPasswordPanel() {
         guard passwordPanelFocusObservers.isEmpty else { return }
+        let generation = deferredHideGeneration
         let center = NotificationCenter.default
         for name in [
             NSWindow.didBecomeKeyNotification,
@@ -225,7 +235,16 @@ class QuickTerminalController: BaseTerminalController {
             passwordPanelFocusObservers.append(center.addObserver(
                 forName: name, object: nil, queue: .main
             ) { [weak self] _ in
-                DispatchQueue.main.async { self?.reevaluateDeferredAutoHide() }
+                guard let self, !self.deferredHideReevaluationQueued else { return }
+                self.deferredHideReevaluationQueued = true
+                DispatchQueue.main.async { [weak self] in
+                    guard let self else { return }
+                    self.deferredHideReevaluationQueued = false
+                    // The session this was queued for may be over.
+                    guard generation == self.deferredHideGeneration,
+                          !self.passwordPanelFocusObservers.isEmpty else { return }
+                    self.reevaluateDeferredAutoHide()
+                }
             })
         }
     }
@@ -235,6 +254,7 @@ class QuickTerminalController: BaseTerminalController {
             NotificationCenter.default.removeObserver(observer)
         }
         passwordPanelFocusObservers.removeAll()
+        deferredHideGeneration &+= 1
     }
 
     private func reevaluateDeferredAutoHide() {
@@ -245,7 +265,8 @@ class QuickTerminalController: BaseTerminalController {
         }
         // Still on the manager (or one of its sheets): keep waiting.
         if PasswordManagerController.shared.ownsKeyWindow { return }
-        // Focus went somewhere else: this is the hide we deferred.
+        // Focus went somewhere else: this is the hide we deferred. Ending
+        // the session first means it can only be carried out once.
         stopWatchingPasswordPanel()
         guard visible, derivedConfig.quickTerminalAutoHide else { return }
         autoHideAfterLosingKey()
