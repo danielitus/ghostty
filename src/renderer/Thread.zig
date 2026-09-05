@@ -93,6 +93,10 @@ app_mailbox: App.Mailbox,
 /// abandoned instead of hanging the joiner forever.
 exited: std.atomic.Value(bool) = .init(false),
 
+/// True while the surface still has to be told that this thread drained
+/// a full mailbox (see `notifyRecovery`). Only touched on this thread.
+recovery_unsent: bool = false,
+
 /// Configuration we need derived from the main config.
 config: DerivedConfig,
 
@@ -330,6 +334,8 @@ fn drainMailbox(self: *Thread) !void {
     defer if (builtin.os.tag.isDarwin()) pool.deinit();
 
     var drained: usize = 0;
+    // Runs even if a handler fails partway, so the count is never lost.
+    defer self.notifyRecovery(drained);
     while (self.mailbox.pop(global.io())) |message| {
         drained += 1;
         log.debug("mailbox message={}", .{message});
@@ -472,12 +478,19 @@ fn drainMailbox(self: *Thread) !void {
             },
         }
     }
-    // A full mailbox means app-side producers timed out or blocked on us
-    // (see Surface.pushRendererMessage). Now that there is room again,
-    // tell the surface so it can deliver what it deferred. Best effort:
-    // if the app mailbox is full too, the next app-side push retries.
-    if (drained >= mailbox_capacity) {
-        _ = self.renderer.surface_mailbox.push(.{ .renderer_recovered = {} }, .instant);
+}
+
+/// A full mailbox means app-side producers timed out or blocked on us
+/// (see Surface.pushRendererMessage). Once there is room again the
+/// surface must be told so it can deliver what it deferred. The
+/// notification is never blocking (that would be a new way to wedge),
+/// so if the app mailbox happens to be full it is remembered and retried
+/// on every later drain and render tick until it gets through.
+fn notifyRecovery(self: *Thread, drained: usize) void {
+    if (drained >= mailbox_capacity) self.recovery_unsent = true;
+    if (!self.recovery_unsent) return;
+    if (self.renderer.surface_mailbox.push(.{ .renderer_recovered = {} }, .instant) > 0) {
+        self.recovery_unsent = false;
     }
 }
 
@@ -597,6 +610,9 @@ fn renderCallback(
         log.warn("render callback fired without data set", .{});
         return .disarm;
     };
+
+    // Retry a recovery notification the app mailbox couldn't take.
+    if (t.recovery_unsent) t.notifyRecovery(0);
 
     // If we're not visible there's no point spending CPU rebuilding cells —
     // we'll catch up when the .visible mailbox message flips us back on.

@@ -840,17 +840,28 @@ pub fn tryDeinit(self: *Surface) bool {
 
 fn deinitImpl(self: *Surface, timeout_ns: ?u64) bool {
     if (timeout_ns) |t| {
-        // Bounded: ask the render thread to stop and confirm it actually
-        // exits before joining anything. The search thread pushes into
-        // the render mailbox with no timeout, so a wedged render thread
-        // strands it as well; checking the renderer first means we never
-        // join the search thread in that state.
+        // Bounded: stop producers before their consumers, and confirm
+        // each thread actually exits before joining it. The search thread
+        // pushes into both the render and app mailboxes with no timeout,
+        // so it goes first, while the render thread is still draining;
+        // if it is stuck anyway (on a full app mailbox we can't drain
+        // from here, or on a wedged render thread), it is abandoned.
+        if (self.search) |*s| {
+            s.state.stop.notify() catch |err|
+                log.err("error notifying search thread to stop, may stall err={}", .{err});
+            if (!s.state.waitForExit(t)) return self.abandon(.search);
+            s.thread.join();
+            s.state.deinit();
+            self.search = null;
+        }
+
+        // Then the render thread, which the IO thread pushes into.
         self.renderer_thread.stop.notify() catch |err|
             log.err("error notifying renderer thread to stop, may stall err={}", .{err});
         if (!self.renderer_thread.waitForExit(t)) return self.abandon(.renderer);
     }
 
-    // Stop search thread
+    // Stop search thread (unbounded path; already stopped when bounded)
     if (self.search) |*s| s.deinit();
 
     // Stop rendering thread
@@ -913,13 +924,23 @@ fn deinitImpl(self: *Surface, timeout_ns: ?u64) bool {
 /// thread not yet joined is detached (it exits on its own if it ever
 /// recovers, and its stop request is already queued), and nothing it can
 /// reach is freed. Returns false for `deinitImpl`.
-fn abandon(self: *Surface, stuck: enum { renderer, io }) bool {
+fn abandon(self: *Surface, stuck: enum { search, renderer, io }) bool {
     log.warn(
         "{s} thread did not exit in time; leaking surface instead of joining it id={x}",
         .{ @tagName(stuck), self.id },
     );
     self.renderer_wedged = true;
     switch (stuck) {
+        .search => {
+            if (self.search) |*s| s.thread.detach();
+            // The other two were not asked to stop yet; do so and detach
+            // them as well so they exit (and the IO thread kills the
+            // child process) whenever they can, just not while we wait.
+            self.renderer_thread.stop.notify() catch {};
+            self.renderer_thr.detach();
+            self.io_thread.stop.notify() catch {};
+            self.io_thr.detach();
+        },
         .renderer => {
             self.renderer_thr.detach();
             // Still ask the IO thread to stop: it is independent of the

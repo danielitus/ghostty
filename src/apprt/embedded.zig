@@ -146,6 +146,12 @@ pub const App = struct {
     /// events start flowing, at which point the system is warm.
     keymap: ?input.Keymap,
 
+    /// Set when the host has freed everything behind the callbacks. Only
+    /// relevant when this struct outlives `ghostty_app_free` because a
+    /// surface was abandoned with live threads: those threads can still
+    /// wake us up, and must hit this gate instead of a dead host.
+    terminated: std.atomic.Value(bool) = .init(false),
+
     /// The configuration for the app. This is owned by this structure.
     config: Config,
 
@@ -267,6 +273,7 @@ pub const App = struct {
     }
 
     pub fn wakeup(self: *const App) void {
+        if (self.terminated.load(.acquire)) return;
         self.opts.wakeup(self.opts.userdata);
     }
 
@@ -309,6 +316,9 @@ pub const App = struct {
         comptime action: apprt.Action.Key,
         value: apprt.Action.Value(action),
     ) !bool {
+        // Nothing may reach the host after it freed its side.
+        if (self.terminated.load(.acquire)) return false;
+
         // Special case certain actions before they are sent to the
         // embedded apprt.
         self.performPreAction(target, action, value);
@@ -1721,6 +1731,19 @@ pub const CAPI = struct {
 
     export fn ghostty_app_free(v: *App) void {
         const core_app = v.core_app;
+
+        // If a surface was abandoned with live threads (see
+        // Surface.tryDeinit), those threads can still push into the app
+        // mailbox and call back into us to wake the host. Close the gate
+        // before anything is torn down, and keep this struct (and the
+        // core app, which leaks itself) so the gate stays readable.
+        if (core_app.leaked_surfaces > 0) {
+            v.terminated.store(true, .release);
+            v.terminate();
+            core_app.destroy();
+            return;
+        }
+
         v.terminate();
         global.alloc().destroy(v);
         core_app.destroy();
