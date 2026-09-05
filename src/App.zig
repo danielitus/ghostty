@@ -168,6 +168,10 @@ pub fn destroy(self: *App) void {
     // Deinitialize the app
     self.deinit();
 
+    // An abandoned surface's threads can still reach our mailbox, so if
+    // any surface leaked, this struct is leaked along with it.
+    if (self.leaked_surfaces > 0) return;
+
     // Free the app memory
     self.alloc.destroy(self);
 }

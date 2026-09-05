@@ -201,6 +201,12 @@ class PasswordManagerController: NSWindowController, NSWindowDelegate {
 
     func windowWillClose(_ notification: Notification) {
         autoOpenSurface = nil
+        // Closing the panel, however it was opened, is a decision about
+        // the prompt on screen: don't offer it again for that prompt
+        // when focus returns to the terminal.
+        if let surface = Self.currentFocusedSurface(), surface.passwordInput {
+            surface.passwordManagerOffered = true
+        }
         if UserDefaults.standard.bool(forKey: "PasswordManagerLockOnClose") {
             PasswordVault.shared.lock()
         }

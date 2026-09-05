@@ -238,7 +238,7 @@ class PasswordVault: ObservableObject {
         do {
             digest = try Self.writeVault(
                 entries: [], key: key, salt: salt,
-                iterations: Self.defaultPBKDF2Iterations, expectedDigest: nil)
+                iterations: Self.defaultPBKDF2Iterations, expectedDigest: nil).digest
         } catch VaultError.staleVault {
             state = .locked
             throw VaultError.staleVault
@@ -258,7 +258,7 @@ class PasswordVault: ObservableObject {
         defer { busy = false }
         let generation = self.generation
 
-        let file = try Self.readVaultFile()
+        let (file, wrappedKeyData) = try Self.readVaultFiles()
         let key = try await Self.deriveKey(
             password: masterPassword, salt: file.salt, iterations: file.iterations)
         guard generation == self.generation else { throw CancellationError() }
@@ -273,7 +273,14 @@ class PasswordVault: ObservableObject {
         // carries the vault binding, before Touch ID is allowed to bypass
         // the KDF on this vault again. Failure here is not an unlock
         // failure; the next save upgrades the file anyway.
-        if file.version < Self.version { upgradeLegacyVault() }
+        if file.version < Self.version {
+            upgradeLegacyVault()
+        } else if biometricsEnabled && !Self.isCurrentWrappedKey(wrappedKeyData) {
+            // Touch ID is on but its wrapper is missing or in the old
+            // format (a build downgrade, a partial upgrade); a password
+            // unlock is the one place a fresh one can be made safely.
+            repairWrappedKey()
+        }
     }
 
     private func upgradeLegacyVault() {
@@ -283,11 +290,32 @@ class PasswordVault: ObservableObject {
             wrapped = try? Self.makeWrappedKeyData(key, vaultSalt: salt)
             if wrapped == nil { disableBiometrics(deleteWrappedKeyMatching: nil) }
         }
-        if let digest = try? Self.writeVault(
+        guard let result = try? Self.writeVault(
             entries: entries, key: key, salt: salt, iterations: iterations,
-            expectedDigest: diskDigest, wrappedKey: wrapped) {
-            diskDigest = digest
+            expectedDigest: diskDigest, wrappedKey: wrapped)
+        else { return }
+        diskDigest = result.digest
+        if wrapped != nil && !result.wrappedKeyInstalled {
+            disableBiometrics(deleteWrappedKeyMatching: nil)
         }
+    }
+
+    private func repairWrappedKey() {
+        guard state == .unlocked, let key, let salt else { return }
+        do {
+            try Self.storeWrappedKey(key, vaultSalt: salt, expectedDigest: diskDigest)
+        } catch {
+            disableBiometrics(deleteWrappedKeyMatching: nil)
+        }
+    }
+
+    /// True if `data` is a wrapped key in the current format. Only the
+    /// magic and version are inspected.
+    nonisolated private static func isCurrentWrappedKey(_ data: Data?) -> Bool {
+        guard let data, data.count > wrappedKeyMagic.count,
+              data.prefix(wrappedKeyMagic.count) == wrappedKeyMagic
+        else { return false }
+        return data[data.startIndex + wrappedKeyMagic.count] == wrappedKeyVersion
     }
 
     /// Unlock using the Secure Enclave-wrapped vault key behind Touch ID.
@@ -460,14 +488,20 @@ class PasswordVault: ObservableObject {
         // disk so a failed save never leaves memory and disk expecting
         // different passwords. Vault and wrapper are replaced under one
         // lock so no reader ever sees a new vault with the old wrapper.
-        let digest = try Self.writeVault(
+        let result = try Self.writeVault(
             entries: entries, key: newKey, salt: newSalt,
             iterations: Self.defaultPBKDF2Iterations, expectedDigest: diskDigest,
             wrappedKey: wrapped)
         self.salt = newSalt
         self.key = newKey
         self.iterations = Self.defaultPBKDF2Iterations
-        self.diskDigest = digest
+        self.diskDigest = result.digest
+
+        // The vault is committed even if the wrapper could not be
+        // installed after it; that only costs Touch ID, never the change.
+        if wrapped != nil && !result.wrappedKeyInstalled {
+            disableBiometrics(deleteWrappedKeyMatching: nil)
+        }
     }
 
     func lock() {
@@ -534,7 +568,7 @@ class PasswordVault: ObservableObject {
         guard state == .unlocked, let key, let salt else { throw VaultError.locked }
         diskDigest = try Self.writeVault(
             entries: newEntries, key: key, salt: salt,
-            iterations: iterations, expectedDigest: diskDigest)
+            iterations: iterations, expectedDigest: diskDigest).digest
         entries = newEntries
     }
 
@@ -546,7 +580,9 @@ class PasswordVault: ObservableObject {
     /// (`nil` when creating: the file must not exist). When `wrappedKey`
     /// is given it is installed under the same lock, right after the
     /// vault, so the pair is never observed half-updated. Returns the
-    /// digest of the vault file just written.
+    /// digest of the vault file just written and whether the wrapper
+    /// was installed: once the vault is on disk the write has succeeded,
+    /// so a wrapper failure after it is reported, not thrown.
     nonisolated private static func writeVault(
         entries: [PasswordEntry],
         key: SymmetricKey,
@@ -554,7 +590,7 @@ class PasswordVault: ObservableObject {
         iterations: UInt32,
         expectedDigest: Data?,
         wrappedKey: Data? = nil
-    ) throws -> Data {
+    ) throws -> (digest: Data, wrappedKeyInstalled: Bool) {
         var plaintext = try JSONEncoder().encode(entries)
         defer { plaintext.resetBytes(in: 0..<plaintext.count) }
 
@@ -584,8 +620,11 @@ class PasswordVault: ObservableObject {
         }
 
         try writeOwnerOnly(data, to: fileURL)
-        if let wrappedKey { try writeOwnerOnly(wrappedKey, to: wrappedKeyURL) }
-        return digest(of: data)
+        var wrappedKeyInstalled = false
+        if let wrappedKey {
+            wrappedKeyInstalled = (try? writeOwnerOnly(wrappedKey, to: wrappedKeyURL)) != nil
+        }
+        return (digest(of: data), wrappedKeyInstalled)
     }
 
     nonisolated private static func digest(of data: Data) -> Data {
