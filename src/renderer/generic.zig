@@ -811,7 +811,10 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
 
             if (DisplayLink != void) {
                 if (self.display_link) |display_link| {
-                    display_link.stop() catch {};
+                    // Only stop a running link; CVDisplayLinkStop is the
+                    // call that has been seen to hang, so never make it
+                    // needlessly.
+                    if (display_link.isRunning()) display_link.stop() catch {};
                     display_link.release();
                 }
             }
@@ -921,11 +924,12 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
             // If we don't support a display link we have no work to do.
             if (comptime DisplayLink == void) return;
 
-            // Stop our display link. If this fails its okay it just means
-            // that we either never started it or the view its attached to
-            // is gone which is fine.
+            // Stop our display link if it is running. If this fails its
+            // okay it just means the view its attached to is gone which
+            // is fine. A link that isn't running is left alone since
+            // CVDisplayLinkStop is the call that has been seen to hang.
             const display_link = self.display_link orelse return;
-            display_link.stop() catch {};
+            if (display_link.isRunning()) display_link.stop() catch {};
         }
 
         /// This is called by the GTK apprt after the surface is
@@ -1151,7 +1155,8 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
         }
 
         /// Create or update the display link and match it to the current
-        /// surface state.
+        /// surface state: running while the surface is visible, stopped
+        /// while it is occluded.
         fn syncDisplayLink(
             self: *Self,
             display_id: ?u32,
@@ -1191,17 +1196,25 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                 };
             }
 
-            const should_run =
-                // Non-visible windows never vsync
-                self.visible and
-                // Only vsync if we have cell changes or animation
-                (self.cells_rebuilt or self.animationWake() != null);
+            // Run the display link whenever the surface is visible and
+            // stop it only when the surface is occluded.
+            //
+            // Upstream parks the link on every idle frame instead
+            // (ghostty-org/ghostty#14035, #14068), which starts and stops
+            // it several times a second on a focused surface with a
+            // blinking cursor. That churn exposed a CoreVideo hang:
+            // CVDisplayLinkStop can block forever, wedging this render
+            // thread and, once its mailbox fills, the app thread too
+            // (whole-app freeze observed 2026-09-04). An idle vsync tick
+            // costs tens of microseconds, so we trade that back for a
+            // link that is stopped only on occlusion, as before #14035.
+            const should_run = self.visible;
 
             if (should_run) {
                 if (!display_link.isRunning()) {
                     display_link.start() catch {};
                 }
-            } else {
+            } else if (display_link.isRunning()) {
                 display_link.stop() catch {};
             }
         }

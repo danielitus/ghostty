@@ -289,6 +289,16 @@ pub const App = struct {
 
     /// Close the given surface.
     pub fn closeSurface(self: *App, surface: *Surface) void {
+        // A surface whose render thread is wedged can't be torn down:
+        // joining the thread would block the app thread forever, and
+        // freeing state the thread still references could crash us if
+        // it ever wakes up. Detach what we can and leak the rest,
+        // including the surface struct itself.
+        if (surface.core_surface.rendererWedged()) {
+            surface.deinitWedged();
+            return;
+        }
+
         surface.deinit();
         self.core_app.alloc.destroy(surface);
     }
@@ -643,6 +653,14 @@ pub const Surface = struct {
 
         // Clean up our core surface so that all the rendering and IO stop.
         self.core_surface.deinit();
+    }
+
+    /// Partial teardown for a surface whose render thread is wedged. See
+    /// `Surface.deinitWedged` in the core; the inspector and title are
+    /// leaked along with everything else the render thread may touch.
+    pub fn deinitWedged(self: *Surface) void {
+        self.app.core_app.deleteSurface(self);
+        self.core_surface.deinitWedged();
     }
 
     /// Initialize the inspector instance. A surface can only have one
@@ -2387,11 +2405,9 @@ pub const CAPI = struct {
     const Darwin = struct {
         export fn ghostty_surface_set_display_id(ptr: *Surface, display_id: u32) void {
             const surface = &ptr.core_surface;
-            _ = surface.renderer_thread.mailbox.push(
-                global.io(),
-                .{ .macos_display_id = display_id },
-                .{ .forever = {} },
-            );
+            // Bounded push; a wedged render thread must not block the
+            // app thread on a display change (see pushRendererMessage).
+            _ = surface.pushRendererMessage(.{ .macos_display_id = display_id });
             surface.renderer_thread.wakeup.notify() catch {};
         }
 

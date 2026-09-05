@@ -528,8 +528,17 @@ pub fn resize(
         }
     }
 
-    // Mail the renderer so that it can update the GPU and re-render
-    _ = self.renderer_mailbox.push(global.io(), .{ .resize = size }, .{ .forever = {} });
+    // Mail the renderer so that it can update the GPU and re-render.
+    // Bounded: a wedged render thread must not take the IO thread down
+    // with it, since app-thread IO pushes would then block too. A
+    // dropped resize is repaired by the next one.
+    if (self.renderer_mailbox.push(
+        global.io(),
+        .{ .resize = size },
+        .{ .ns = 1 * std.time.ns_per_s },
+    ) == 0) {
+        log.warn("renderer mailbox full, dropping resize message", .{});
+    }
     self.renderer_wakeup.notify() catch {};
 }
 

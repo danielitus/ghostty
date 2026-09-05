@@ -159,6 +159,23 @@ focused: bool = true,
 /// visible so reporting remains conservative.
 visible: bool = true,
 
+/// Renderer messages the app thread could not deliver because the render
+/// thread's mailbox stayed full (see `pushRendererMessage`). Only the
+/// latest value of each kind is kept; they are retried before the next
+/// push and on every render request, so a render thread that recovers
+/// converges on the current state instead of staying stale.
+renderer_pending: RendererPending = .{},
+
+/// True while the render thread is considered wedged: an app-thread push
+/// timed out and none has succeeded since. Pushes then fail fast instead
+/// of stalling the UI again, and closing the surface leaks its resources
+/// rather than joining a thread that will never exit.
+renderer_wedged: bool = false,
+
+/// The font grid key the render thread currently holds. This lags
+/// `font_grid_key` while a font grid message is pending delivery.
+renderer_font_grid_key: font.SharedGridSet.Key,
+
 /// Used to determine whether to continuously scroll.
 selection_scroll_active: bool = false,
 
@@ -602,6 +619,7 @@ pub fn init(
         .rt_app = rt_app,
         .rt_surface = rt_surface,
         .font_grid_key = font_grid_key,
+        .renderer_font_grid_key = font_grid_key,
         .font_size = font_size,
         .font_size_adjusted = false,
         .font_metrics = font_grid.metrics,
@@ -798,6 +816,15 @@ pub fn init(
 }
 
 pub fn deinit(self: *Surface) void {
+    // A wedged render thread never exits, so joining it would hang the
+    // app thread forever. Apprts should check `rendererWedged` and call
+    // `deinitWedged` (and not free the surface memory); if one gets here
+    // anyway, a leak still beats a frozen app.
+    if (self.renderer_wedged) {
+        self.deinitWedged();
+        return;
+    }
+
     // Stop search thread
     if (self.search) |*s| s.deinit();
 
@@ -817,6 +844,10 @@ pub fn deinit(self: *Surface) void {
             log.err("error notifying io thread to stop, may stall err={}", .{err});
         self.io_thr.join();
     }
+
+    // Anything still pending was never handed to the render thread, so
+    // its resources are ours to release now that the thread is gone.
+    self.dropPendingRendererMessages();
 
     // We need to deinit AFTER everything is stopped, since there are
     // shared values between the two threads.
@@ -845,6 +876,44 @@ pub fn deinit(self: *Surface) void {
     self.config.deinit();
 
     log.info("surface closed id={x}", .{self.id});
+}
+
+/// True once an app-thread push to the render thread timed out and no
+/// push has succeeded since. Apprts use this to avoid joining the render
+/// thread on close; see `deinitWedged`.
+pub fn rendererWedged(self: *const Surface) bool {
+    return self.renderer_wedged;
+}
+
+/// Tear down as much of a surface as is safe when its render thread is
+/// wedged (see `pushRendererMessage`). The render thread is detached,
+/// never joined, and everything it can still touch (renderer, terminal
+/// state, mailbox, config, font grid refs, the surface struct itself) is
+/// intentionally leaked so a thread that wakes up late finds valid
+/// memory. The IO thread is independent of the render thread since its
+/// renderer pushes are bounded, so it is stopped normally, which kills
+/// the child process. Callers must not free the surface afterwards.
+pub fn deinitWedged(self: *Surface) void {
+    log.warn(
+        "render thread is wedged; leaking surface instead of joining it id={x}",
+        .{self.id},
+    );
+
+    // Ask it to stop anyway: if it ever recovers it exits on its own.
+    self.renderer_thread.stop.notify() catch {};
+    self.renderer_thr.detach();
+
+    // The search thread pushes to the render mailbox with no timeout,
+    // so it may be stuck in the same way. Leave it.
+
+    // Stop our IO thread. This kills the child process and quits the
+    // read thread; the terminal state it shares with the renderer is
+    // left allocated.
+    self.io_thread.stop.notify() catch |err|
+        log.err("error notifying io thread to stop, may stall err={}", .{err});
+    self.io_thr.join();
+
+    log.info("surface leaked id={x}", .{self.id});
 }
 
 /// Close this surface. This will trigger the runtime to start the
@@ -920,7 +989,7 @@ pub fn activateInspector(self: *Surface) !void {
     }
 
     // Notify our components we have an inspector active
-    _ = self.renderer_thread.mailbox.push(global.io(), .{ .inspector = true }, .{ .forever = {} });
+    _ = self.pushRendererMessage(.{ .inspector = true });
     self.queueIo(.{ .inspector = true }, .unlocked);
 }
 
@@ -937,7 +1006,7 @@ pub fn deactivateInspector(self: *Surface) void {
     }
 
     // Notify our components we have deactivated inspector
-    _ = self.renderer_thread.mailbox.push(global.io(), .{ .inspector = false }, .{ .forever = {} });
+    _ = self.pushRendererMessage(.{ .inspector = false });
     self.queueIo(.{ .inspector = false }, .unlocked);
 
     // Deinit the inspector
@@ -1816,7 +1885,9 @@ pub fn updateConfig(
     termio_config_ptr.* = try termio.Termio.DerivedConfig.init(self.alloc, config);
     errdefer termio_config_ptr.deinit();
 
-    _ = self.renderer_thread.mailbox.push(global.io(), renderer_message, .{ .forever = {} });
+    // If the render thread is wedged and this is dropped, the heap
+    // config in the message leaks. That beats hanging the app thread.
+    _ = self.pushRendererMessage(renderer_message);
     self.queueIo(.{
         .change_config = .{
             .alloc = self.alloc,
@@ -2443,37 +2514,51 @@ pub fn setFontSize(self: *Surface, size: font.face.DesiredSize) !void {
         &self.config.font,
         self.font_size,
     );
-    errdefer self.app.font_grid_set.deref(font_grid_key);
 
-    // Set our cell size
+    // Notify our render thread of the new font stack. The renderer MUST
+    // accept the new font grid and deref the old, so the message names
+    // the grid the renderer actually holds, which lags ours while an
+    // earlier grid is still undelivered. Nothing between the ref above
+    // and this push can fail, so ownership of the new ref moves cleanly
+    // either to the renderer (delivered) or to `renderer_pending`.
+    const delivered = self.pushRendererMessage(.{
+        .font_grid = .{
+            .grid = font_grid,
+            .set = &self.app.font_grid_set,
+            .old_key = self.renderer_font_grid_key,
+            .new_key = font_grid_key,
+        },
+    });
+
+    // Once we've sent the key we can replace our key
+    self.font_grid_key = font_grid_key;
+
+    // Apply the new metrics and cell size only once the renderer has the
+    // grid; otherwise the terminal and the renderer would disagree on
+    // geometry until the pending message is delivered (see
+    // `flushPendingRendererMessages`, which applies them then).
+    if (delivered) try self.applyFontGrid(font_grid);
+
+    // Schedule render which also drains our mailbox
+    self.queueRender() catch unreachable;
+}
+
+/// Adopt the metrics of a font grid the render thread now holds.
+fn applyFontGrid(self: *Surface, font_grid: *font.SharedGrid) !void {
+    self.font_metrics = font_grid.metrics;
     try self.setCellSize(.{
         .width = font_grid.metrics.cell_width,
         .height = font_grid.metrics.cell_height,
     });
-
-    // Notify our render thread of the new font stack. The renderer
-    // MUST accept the new font grid and deref the old.
-    _ = self.renderer_thread.mailbox.push(global.io(), .{
-        .font_grid = .{
-            .grid = font_grid,
-            .set = &self.app.font_grid_set,
-            .old_key = self.font_grid_key,
-            .new_key = font_grid_key,
-        },
-    }, .{ .forever = {} });
-
-    // Once we've sent the key we can replace our key
-    self.font_grid_key = font_grid_key;
-    self.font_metrics = font_grid.metrics;
-
-    // Schedule render which also drains our mailbox
-    self.queueRender() catch unreachable;
 }
 
 /// This queues a render operation with the renderer thread. The render
 /// isn't guaranteed to happen immediately but it will happen as soon as
 /// practical.
 fn queueRender(self: *Surface) !void {
+    // Give deferred state changes another chance every time we ask the
+    // render thread to draw; this is how a recovered thread catches up.
+    if (!self.renderer_pending.isEmpty()) self.flushPendingRendererMessages();
     try self.renderer_thread.wakeup.notify();
 }
 
@@ -3301,6 +3386,167 @@ pub fn textCallback(self: *Surface, text: []const u8) !void {
     try self.completeClipboardPaste(text, true);
 }
 
+/// How long the app thread waits for space in the renderer mailbox
+/// before giving up on a push. A healthy render thread drains its
+/// mailbox on every loop iteration, so a queue that stays full this
+/// long means the thread is wedged (seen 2026-09-04 with a render
+/// thread stuck forever inside CVDisplayLinkStop). Waiting forever
+/// there turns one dead surface into a frozen app.
+const renderer_mailbox_timeout_ns: u64 = 5 * std.time.ns_per_s;
+
+/// State-carrying renderer messages the app thread could not deliver.
+/// Only the newest of each kind is kept because each one fully replaces
+/// the previous value of that kind on the render thread.
+const RendererPending = struct {
+    visible: ?bool = null,
+    focus: ?bool = null,
+    macos_display_id: ?u32 = null,
+    change_config: ?rendererpkg.Message = null,
+    font_grid: ?rendererpkg.Message = null,
+
+    fn isEmpty(self: RendererPending) bool {
+        return self.visible == null and
+            self.focus == null and
+            self.macos_display_id == null and
+            self.change_config == null and
+            self.font_grid == null;
+    }
+};
+
+/// Send a message to the render thread from the app thread.
+///
+/// The wait for mailbox space is bounded by `renderer_mailbox_timeout_ns`.
+/// After the first timeout the surface is marked wedged and later pushes
+/// fail fast (no repeated UI stalls) until one succeeds again.
+///
+/// Messages that carry state (visibility, focus, display, config, font
+/// grid) are never lost: an undelivered one is kept in `renderer_pending`
+/// and retried, in order, before the next push and on every render
+/// request. Ownership of any resources in a deferred message stays with
+/// the surface until it is delivered. Returns false if the message was
+/// deferred (or, for messages that carry no state, dropped).
+pub fn pushRendererMessage(self: *Surface, msg: rendererpkg.Message) bool {
+    // A newer message of the same kind supersedes anything pending.
+    self.supersedePendingRendererMessage(msg);
+
+    // Preserve ordering: deliver what was deferred before this one.
+    self.flushPendingRendererMessages();
+
+    if (self.tryPushRendererMessage(msg)) return true;
+    self.deferRendererMessage(msg);
+    return false;
+}
+
+/// Single bounded push attempt. Maintains the wedged flag and the
+/// renderer's font grid bookkeeping.
+fn tryPushRendererMessage(self: *Surface, msg: rendererpkg.Message) bool {
+    const timeout: rendererpkg.Thread.Mailbox.Timeout = if (self.renderer_wedged)
+        .{ .instant = {} }
+    else
+        .{ .ns = renderer_mailbox_timeout_ns };
+
+    if (self.renderer_thread.mailbox.push(global.io(), msg, timeout) != 0) {
+        if (self.renderer_wedged) {
+            log.info("render thread is draining its mailbox again", .{});
+            self.renderer_wedged = false;
+        }
+        if (msg == .font_grid) self.renderer_font_grid_key = msg.font_grid.new_key;
+        return true;
+    }
+
+    if (!self.renderer_wedged) {
+        log.warn(
+            "renderer mailbox still full after {d}s, render thread looks wedged; deferring message={s}",
+            .{ renderer_mailbox_timeout_ns / std.time.ns_per_s, @tagName(msg) },
+        );
+        self.renderer_wedged = true;
+    }
+    return false;
+}
+
+fn supersedePendingRendererMessage(self: *Surface, msg: rendererpkg.Message) void {
+    const p = &self.renderer_pending;
+    switch (msg) {
+        .visible => p.visible = null,
+        .focus => p.focus = null,
+        .macos_display_id => p.macos_display_id = null,
+        .change_config => if (p.change_config) |old| {
+            old.deinit();
+            p.change_config = null;
+        },
+        .font_grid => if (p.font_grid) |old| {
+            // The ref for the undelivered grid is still ours.
+            old.font_grid.set.deref(old.font_grid.new_key);
+            p.font_grid = null;
+        },
+        else => {},
+    }
+}
+
+fn deferRendererMessage(self: *Surface, msg: rendererpkg.Message) void {
+    const p = &self.renderer_pending;
+    switch (msg) {
+        .visible => |v| p.visible = v,
+        .focus => |v| p.focus = v,
+        .macos_display_id => |v| p.macos_display_id = v,
+        .change_config => p.change_config = msg,
+        .font_grid => p.font_grid = msg,
+        // Inspector toggles only set a flag the render thread doesn't
+        // act on today; nothing to reconcile.
+        else => log.warn("dropping undeliverable renderer message={s}", .{@tagName(msg)}),
+    }
+}
+
+/// Retry deferred messages in a fixed order (config before font grid,
+/// then display, visibility, focus). Stops at the first failure so
+/// ordering between kinds is preserved.
+fn flushPendingRendererMessages(self: *Surface) void {
+    const p = &self.renderer_pending;
+
+    if (p.change_config) |msg| {
+        if (!self.tryPushRendererMessage(msg)) return;
+        p.change_config = null;
+    }
+
+    if (p.font_grid) |msg| {
+        if (!self.tryPushRendererMessage(msg)) return;
+        p.font_grid = null;
+        // The renderer holds the grid now; bring the terminal to match.
+        self.applyFontGrid(msg.font_grid.grid) catch |err| {
+            log.warn("error applying deferred font grid err={}", .{err});
+        };
+    }
+
+    if (p.macos_display_id) |id| {
+        if (!self.tryPushRendererMessage(.{ .macos_display_id = id })) return;
+        p.macos_display_id = null;
+    }
+
+    if (p.visible) |v| {
+        if (!self.tryPushRendererMessage(.{ .visible = v })) return;
+        p.visible = null;
+    }
+
+    if (p.focus) |v| {
+        if (!self.tryPushRendererMessage(.{ .focus = v })) return;
+        p.focus = null;
+    }
+}
+
+/// Release resources owned by deferred messages. Only valid once the
+/// render thread has exited, since it may otherwise still be handed them.
+fn dropPendingRendererMessages(self: *Surface) void {
+    const p = &self.renderer_pending;
+    if (p.change_config) |msg| msg.deinit();
+    if (p.font_grid) |msg| {
+        // The renderer never received the message telling it to release
+        // the grid it holds, so that ref is still outstanding. Our own
+        // ref (the new key) is released by the normal font grid cleanup.
+        msg.font_grid.set.deref(msg.font_grid.old_key);
+    }
+    p.* = .{};
+}
+
 /// Callback for when the surface is fully visible or not, regardless
 /// of focus state. This is used to pause rendering when the surface
 /// is not visible, and also re-render when it becomes visible again.
@@ -3326,9 +3572,7 @@ pub fn occlusionCallback(self: *Surface, visible: bool) !void {
         } }, .unlocked);
     }
 
-    _ = self.renderer_thread.mailbox.push(global.io(), .{
-        .visible = visible,
-    }, .{ .forever = {} });
+    _ = self.pushRendererMessage(.{ .visible = visible });
 
     try self.queueRender();
 }
@@ -3347,9 +3591,7 @@ pub fn focusCallback(self: *Surface, focused: bool) !void {
     self.focused = focused;
 
     // Notify our render thread of the new state
-    _ = self.renderer_thread.mailbox.push(global.io(), .{
-        .focus = focused,
-    }, .{ .forever = {} });
+    _ = self.pushRendererMessage(.{ .focus = focused });
 
     if (!focused) unfocused: {
         // If we lost focus and we have a keypress, then we want to send a key
