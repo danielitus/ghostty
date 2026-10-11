@@ -1411,6 +1411,27 @@ input: RepeatableReadableIO = .{},
 /// This can be changed at runtime but will only affect new terminal surfaces.
 @"scrollback-limit-lines": Limit(usize, std.math.maxInt(usize)) = .default,
 
+/// If set, every terminal surface logs all of its pty output, raw and
+/// unmodified (including escape sequences), to its own file in this
+/// directory. This matches iTerm2's automatic session logging in raw mode.
+/// Use `cat` on a log to replay it in a terminal.
+///
+/// Each surface gets a file named `YYYYMMDD_HHMMSS.ghostty.<pid>.<id>.log`,
+/// timestamped with the local time of its first output. The directory is
+/// created if it doesn't exist, and log files are only readable by the
+/// current user. Only output is logged, so keyboard input that the program
+/// doesn't echo (such as passwords at a prompt) is not recorded.
+///
+/// Logs are never rotated or deleted by Ghostty.
+///
+/// If the path is not absolute, it is considered relative to the directory
+/// of the configuration file that it is referenced from, or from the current
+/// working directory if this is used as a CLI flag. The path may be prefixed
+/// with `~/` to reference the user's home directory.
+///
+/// This can be changed at runtime but will only affect new terminal surfaces.
+@"session-log-directory": ?Path = null,
+
 /// Whether to compress scrollback pages while the terminal is idle.
 ///
 /// Ghostty does its best to only compress when idle and decompress

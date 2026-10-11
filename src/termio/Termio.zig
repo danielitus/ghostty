@@ -65,6 +65,11 @@ mailbox: termio.Mailbox,
 /// from the child process and calls callbacks in the stream handler.
 terminal_stream: StreamHandler.Stream,
 
+/// Raw log of all pty output, if `session-log-directory` is set. The
+/// directory is captured at init, so a config reload only affects
+/// surfaces created afterwards.
+session_log: termio.SessionLog,
+
 /// Last time the cursor was reset. This is used to prevent message
 /// flooding with cursor resets.
 last_cursor_reset: ?std.Io.Timestamp = null,
@@ -331,6 +336,15 @@ pub fn init(self: *Termio, alloc: Allocator, opts: termio.Options) !void {
         alloc,
         opts.full_config,
     );
+    errdefer if (thread_enter_state) |v| v.destroy();
+
+    var session_log: termio.SessionLog = try .init(
+        alloc,
+        if (opts.full_config.@"session-log-directory") |p| switch (p) {
+            .optional, .required => |v| v,
+        } else null,
+    );
+    errdefer session_log.deinit(alloc);
 
     self.* = .{
         .alloc = alloc,
@@ -348,6 +362,7 @@ pub fn init(self: *Termio, alloc: Allocator, opts: termio.Options) !void {
             .handler = handler,
         }),
         .thread_enter_state = thread_enter_state,
+        .session_log = session_log,
     };
 }
 
@@ -362,6 +377,10 @@ pub fn deinit(self: *Termio) void {
 
     // Clear any initial state if we have it
     if (self.thread_enter_state) |v| v.destroy();
+
+    // The backend has stopped producing output by now, so the log
+    // can't be written to concurrently.
+    self.session_log.deinit(self.alloc);
 }
 
 pub fn threadEnter(
@@ -704,6 +723,9 @@ pub fn focusGained(self: *Termio, td: *ThreadData, focused: bool) !void {
 /// call with pty data but it is also called by the read thread when using
 /// an exec subprocess.
 pub fn processOutput(self: *Termio, buf: []const u8) void {
+    // Log before taking the lock so disk IO never holds up the renderer.
+    self.session_log.write(buf);
+
     // We are modifying terminal state from here on out and we need
     // the lock to grab our read data.
     self.renderer_state.mutex.lockUncancelable(global.io());

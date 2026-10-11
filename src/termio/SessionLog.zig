@@ -1,0 +1,204 @@
+//! Raw session logging: every byte the pty writes is appended, unmodified,
+//! to a per-surface file. This mirrors iTerm2's "automatically log session
+//! input/output" in raw mode, so the logs can be replayed with `cat` or
+//! stripped of escape sequences with standard tools.
+//!
+//! The log file is opened lazily on the first output and only ever touched
+//! from the thread that processes pty output, so no locking is needed.
+//! Writes are unbuffered so the log is complete up to the last byte even if
+//! the surface is abandoned without being torn down.
+const SessionLog = @This();
+
+const std = @import("std");
+const builtin = @import("builtin");
+const Allocator = std.mem.Allocator;
+const global = @import("../global.zig");
+
+const log = std.log.scoped(.session_log);
+
+/// Directory to create the log in, or null if logging is disabled.
+dir: ?[]const u8 = null,
+
+/// The open log file, once the first output has been written.
+file: ?std.Io.File = null,
+
+/// Set after an open or write error so we warn once and stop trying.
+failed: bool = false,
+
+pub fn init(alloc: Allocator, dir: ?[]const u8) Allocator.Error!SessionLog {
+    const d = dir orelse return .{};
+    if (d.len == 0) return .{};
+    return .{ .dir = try alloc.dupe(u8, d) };
+}
+
+pub fn deinit(self: *SessionLog, alloc: Allocator) void {
+    if (self.file) |f| f.close(global.io());
+    if (self.dir) |d| alloc.free(d);
+    self.* = .{};
+}
+
+/// Append pty output to the log. Errors disable logging for this session.
+pub fn write(self: *SessionLog, bytes: []const u8) void {
+    if (self.dir == null or self.failed or bytes.len == 0) return;
+
+    const file = self.file orelse file: {
+        const f = self.open() catch |err| {
+            log.warn("failed to open session log in dir={s} err={}", .{ self.dir.?, err });
+            self.failed = true;
+            return;
+        };
+        self.file = f;
+        break :file f;
+    };
+
+    file.writeStreamingAll(global.io(), bytes) catch |err| {
+        log.warn("failed to write session log, disabling err={}", .{err});
+        file.close(global.io());
+        self.file = null;
+        self.failed = true;
+    };
+}
+
+fn open(self: *SessionLog) !std.Io.File {
+    const io = global.io();
+    const dir_path = self.dir.?;
+
+    try std.Io.Dir.cwd().createDirPath(io, dir_path);
+    var dir = try std.Io.Dir.cwd().openDir(io, dir_path, .{});
+    defer dir.close(io);
+
+    var rand: [4]u8 = undefined;
+    io.random(&rand);
+
+    var name_buf: [64]u8 = undefined;
+    const name = try filename(
+        &name_buf,
+        localTime(std.Io.Timestamp.now(io, .real).toSeconds()),
+        processId(),
+        std.mem.readInt(u32, &rand, .little),
+    );
+
+    const file = try dir.createFile(io, name, switch (builtin.os.tag) {
+        .windows => .{ .exclusive = true },
+        // Logs capture everything shown in the terminal, so keep them
+        // private to the user.
+        else => .{ .exclusive = true, .permissions = .fromMode(0o600) },
+    });
+    log.info("logging session to {s}/{s}", .{ dir_path, name });
+    return file;
+}
+
+/// Broken-down calendar time used for the log filename.
+pub const Time = struct {
+    year: u32,
+    month: u8,
+    day: u8,
+    hour: u8,
+    minute: u8,
+    second: u8,
+};
+
+/// Build the log filename: `YYYYMMDD_HHMMSS.ghostty.<pid>.<random>.log`.
+/// The leading timestamp keeps a directory listing in chronological
+/// order, matching iTerm2's log naming.
+pub fn filename(buf: []u8, t: Time, pid: u64, random: u32) ![]const u8 {
+    return std.fmt.bufPrint(
+        buf,
+        "{d:0>4}{d:0>2}{d:0>2}_{d:0>2}{d:0>2}{d:0>2}.ghostty.{d}.{x:0>8}.log",
+        .{ t.year, t.month, t.day, t.hour, t.minute, t.second, pid, random },
+    );
+}
+
+fn processId() u64 {
+    return switch (builtin.os.tag) {
+        .windows => std.os.windows.GetCurrentProcessId(),
+        else => @intCast(std.c.getpid()),
+    };
+}
+
+/// struct tm. The first nine fields are fixed by C; the trailing two are
+/// the BSD/glibc/musl extensions, included so the size is right.
+const Tm = extern struct {
+    sec: c_int,
+    min: c_int,
+    hour: c_int,
+    mday: c_int,
+    mon: c_int,
+    year: c_int,
+    wday: c_int,
+    yday: c_int,
+    isdst: c_int,
+    gmtoff: c_long,
+    zone: ?[*:0]const u8,
+};
+
+extern "c" fn localtime_r(timep: *const c_long, result: *Tm) ?*Tm;
+
+/// Local time for `secs` since the epoch, falling back to UTC where
+/// libc's localtime_r isn't available or fails.
+fn localTime(secs: i64) Time {
+    if (comptime builtin.os.tag != .windows and builtin.link_libc) local: {
+        const t: c_long = @intCast(secs);
+        var tm: Tm = undefined;
+        _ = localtime_r(&t, &tm) orelse break :local;
+        return .{
+            .year = @intCast(tm.year + 1900),
+            .month = @intCast(tm.mon + 1),
+            .day = @intCast(tm.mday),
+            .hour = @intCast(tm.hour),
+            .minute = @intCast(tm.min),
+            .second = @intCast(tm.sec),
+        };
+    }
+
+    return utcTime(secs);
+}
+
+fn utcTime(secs: i64) Time {
+    const epoch = std.time.epoch;
+    const es: epoch.EpochSeconds = .{ .secs = @intCast(@max(secs, 0)) };
+    const yd = es.getEpochDay().calculateYearDay();
+    const md = yd.calculateMonthDay();
+    const ds = es.getDaySeconds();
+    return .{
+        .year = yd.year,
+        .month = md.month.numeric(),
+        .day = @as(u8, md.day_index) + 1,
+        .hour = ds.getHoursIntoDay(),
+        .minute = ds.getMinutesIntoHour(),
+        .second = ds.getSecondsIntoMinute(),
+    };
+}
+
+test "filename" {
+    var buf: [64]u8 = undefined;
+    try std.testing.expectEqualStrings(
+        "20261004_062426.ghostty.59121.00c0ffee.log",
+        try filename(&buf, .{
+            .year = 2026,
+            .month = 10,
+            .day = 4,
+            .hour = 6,
+            .minute = 24,
+            .second = 26,
+        }, 59121, 0xc0ffee),
+    );
+}
+
+test "utcTime" {
+    // 2026-10-11T17:04:05Z
+    const t = utcTime(1791738245);
+    try std.testing.expectEqual(@as(u32, 2026), t.year);
+    try std.testing.expectEqual(@as(u8, 10), t.month);
+    try std.testing.expectEqual(@as(u8, 11), t.day);
+    try std.testing.expectEqual(@as(u8, 17), t.hour);
+    try std.testing.expectEqual(@as(u8, 4), t.minute);
+    try std.testing.expectEqual(@as(u8, 5), t.second);
+}
+
+test "disabled log ignores writes" {
+    var s = try SessionLog.init(std.testing.allocator, null);
+    defer s.deinit(std.testing.allocator);
+    s.write("hello");
+    try std.testing.expect(s.file == null);
+}
