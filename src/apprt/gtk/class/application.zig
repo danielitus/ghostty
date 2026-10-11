@@ -805,6 +805,7 @@ pub const Application = extern struct {
 
             // Unimplemented
             .secure_input,
+            .broadcast_input,
             .close_all_windows,
             .float_window,
             .toggle_visibility,

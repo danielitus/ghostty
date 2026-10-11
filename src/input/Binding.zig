@@ -802,6 +802,30 @@ pub const Action = union(enum) {
     /// option.
     toggle_mouse_reporting,
 
+    /// Broadcast keyboard input and pastes from the focused terminal to
+    /// other terminals, like iTerm2's "Broadcast Input".
+    ///
+    /// Valid arguments:
+    ///
+    ///   - `all_tabs`
+    ///
+    ///     Send input to every split in every tab of the current window.
+    ///
+    ///   - `current_tab`
+    ///
+    ///     Send input to every split in the current tab.
+    ///
+    ///   - `off`
+    ///
+    ///     Stop broadcasting; input goes to the focused terminal only.
+    ///
+    /// `all_tabs` and `current_tab` toggle: triggering the mode that is
+    /// already active turns broadcasting off. Key presses that trigger a
+    /// keybind are never broadcast.
+    ///
+    /// Only implemented on macOS.
+    toggle_broadcast_input: BroadcastInputMode,
+
     /// Toggle the command palette.
     ///
     /// The command palette is a popup that lets you see what actions
@@ -1197,6 +1221,12 @@ pub const Action = union(enum) {
         hide,
     };
 
+    pub const BroadcastInputMode = enum {
+        all_tabs,
+        current_tab,
+        off,
+    };
+
     pub const CloseTabMode = enum {
         this,
         other,
@@ -1426,6 +1456,7 @@ pub const Action = union(enum) {
             .toggle_window_decorations,
             .toggle_window_float_on_top,
             .toggle_secure_input,
+            .toggle_broadcast_input,
             .toggle_mouse_reporting,
             .toggle_command_palette,
             .toggle_background_opacity,
@@ -3397,6 +3428,20 @@ test "parse: action with enum" {
         try testing.expect(binding.action == .new_split);
         try testing.expectEqual(Action.SplitDirection.right, binding.action.new_split);
     }
+}
+
+test "parse: toggle_broadcast_input" {
+    const testing = std.testing;
+
+    {
+        const binding = try parseSingle("super+shift+i=toggle_broadcast_input:all_tabs");
+        try testing.expectEqual(Action.BroadcastInputMode.all_tabs, binding.action.toggle_broadcast_input);
+    }
+    {
+        const binding = try parseSingle("super+alt+i=toggle_broadcast_input:current_tab");
+        try testing.expectEqual(Action.BroadcastInputMode.current_tab, binding.action.toggle_broadcast_input);
+    }
+    try testing.expectError(Error.InvalidFormat, parseSingle("a=toggle_broadcast_input:nope"));
 }
 
 test "parse: action with enum with default" {

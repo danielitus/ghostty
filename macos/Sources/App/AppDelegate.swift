@@ -62,6 +62,9 @@ class AppDelegate: NSObject,
     @IBOutlet private var menuSelectSplitLeft: NSMenuItem?
     @IBOutlet private var menuSelectSplitRight: NSMenuItem?
     @IBOutlet private var menuReturnToDefaultSize: NSMenuItem?
+    private var menuBroadcastAllTabs: NSMenuItem?
+    private var menuBroadcastCurrentTab: NSMenuItem?
+    private var menuBroadcastOff: NSMenuItem?
     @IBOutlet private var menuFloatOnTop: NSMenuItem?
     @IBOutlet private var menuUseAsDefault: NSMenuItem?
     @IBOutlet private var menuSetAsDefaultTerminal: NSMenuItem?
@@ -328,6 +331,7 @@ class AppDelegate: NSObject,
 
         // Setup our menu
         setupMenuImages()
+        setupBroadcastInputMenu()
 
         // Setup signal handlers
         setupSignals()
@@ -1137,6 +1141,40 @@ extension AppDelegate {
     }
 
     /// Setup all the images for our menu items.
+    /// Add Window > Broadcast Input, mirroring iTerm2's Shell > Broadcast Input.
+    /// Built in code so the fork doesn't carry xib edits across merges.
+    @MainActor private func setupBroadcastInputMenu() {
+        guard menuBroadcastAllTabs == nil,
+              let anchor = menuReturnToDefaultSize,
+              let windowMenu = anchor.menu else { return }
+
+        func item(_ title: String, _ action: Selector) -> NSMenuItem {
+            NSMenuItem(title: title, action: action, keyEquivalent: "")
+        }
+        let allTabs = item("Broadcast Input to All Panes in All Tabs",
+                           #selector(BaseTerminalController.toggleBroadcastInputAllTabs(_:)))
+        let currentTab = item("Broadcast Input to All Panes in Current Tab",
+                              #selector(BaseTerminalController.toggleBroadcastInputCurrentTab(_:)))
+        let off = item("Send Input to Current Session Only",
+                       #selector(BaseTerminalController.stopBroadcastInput(_:)))
+
+        let submenu = NSMenu(title: "Broadcast Input")
+        submenu.items = [off, .separator(), allTabs, currentTab]
+        let parent = NSMenuItem(title: "Broadcast Input", action: nil, keyEquivalent: "")
+        parent.submenu = submenu
+        parent.setImageIfDesired(systemSymbolName: "dot.radiowaves.left.and.right")
+
+        // Right before "Return To Default Size", in its own section.
+        let index = windowMenu.index(of: anchor)
+        windowMenu.insertItem(parent, at: index)
+        windowMenu.insertItem(.separator(), at: index + 1)
+
+        menuBroadcastAllTabs = allTabs
+        menuBroadcastCurrentTab = currentTab
+        menuBroadcastOff = off
+        syncMenuShortcuts(ghostty.config)
+    }
+
     private func setupMenuImages() {
         // Note: This COULD Be done all in the xib file, but I find it easier to
         // modify this stuff as code.
@@ -1228,6 +1266,9 @@ extension AppDelegate {
         syncMenuShortcut(config, action: "resize_split:left,10", menuItem: self.menuMoveSplitDividerLeft)
         syncMenuShortcut(config, action: "equalize_splits", menuItem: self.menuEqualizeSplits)
         syncMenuShortcut(config, action: "reset_window_size", menuItem: self.menuReturnToDefaultSize)
+        syncMenuShortcut(config, action: "toggle_broadcast_input:all_tabs", menuItem: self.menuBroadcastAllTabs)
+        syncMenuShortcut(config, action: "toggle_broadcast_input:current_tab", menuItem: self.menuBroadcastCurrentTab)
+        syncMenuShortcut(config, action: "toggle_broadcast_input:off", menuItem: self.menuBroadcastOff)
 
         syncMenuShortcut(config, action: "increase_font_size:1", menuItem: self.menuIncreaseFontSize)
         syncMenuShortcut(config, action: "decrease_font_size:1", menuItem: self.menuDecreaseFontSize)

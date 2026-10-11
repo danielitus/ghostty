@@ -131,6 +131,11 @@ extension Ghostty {
                     )
                 }
 
+                // Broadcast input indicator
+                if surfaceView.broadcastInputActive {
+                    BroadcastInputOverlay()
+                }
+
                 // Show bell border if enabled
                 if ghostty.config.bellFeatures.contains(.border) {
                     BellBorderOverlay(bell: surfaceView.bell)
@@ -898,6 +903,41 @@ extension Ghostty {
                 let wave = sin((phase + offset) * .pi * 2)
                 return 0.3 + 0.7 * ((wave + 1) / 2)
             }
+        }
+    }
+
+    /// Persistent red border and badge while input to this surface is being
+    /// broadcast, so it's never on by accident (like iTerm2's red stripes).
+    struct BroadcastInputOverlay: View {
+        private let color = Color(red: 0.9, green: 0.2, blue: 0.2)
+
+        var body: some View {
+            ZStack(alignment: .topLeading) {
+                Rectangle()
+                    .strokeBorder(color.opacity(0.7), lineWidth: 2)
+
+                HStack(spacing: 5) {
+                    Image(systemName: "dot.radiowaves.left.and.right")
+                        .font(.system(size: 12))
+                    Text("Broadcasting")
+                        .font(.system(size: 12, weight: .medium))
+                }
+                .padding(.horizontal, 8)
+                .padding(.vertical, 4)
+                .background(
+                    RoundedRectangle(cornerRadius: 6)
+                        .fill(.regularMaterial)
+                        .overlay(
+                            RoundedRectangle(cornerRadius: 6)
+                                .strokeBorder(color.opacity(0.6), lineWidth: 1.5)
+                        )
+                )
+                .foregroundStyle(color)
+                .padding(8)
+            }
+            .allowsHitTesting(false)
+            .accessibilityElement(children: .ignore)
+            .accessibilityLabel("Broadcasting input")
         }
     }
 

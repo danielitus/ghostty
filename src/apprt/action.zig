@@ -364,6 +364,10 @@ pub const Action = union(Key) {
     /// split or the window is fullscreen.
     resize_window: ResizeWindow,
 
+    /// Toggle broadcasting keyboard input from the target surface to other
+    /// surfaces. See `BroadcastInput` for the modes.
+    broadcast_input: BroadcastInput,
+
     /// Sync with: ghostty_action_tag_e
     pub const Key = enum(c_int) {
         quit,
@@ -436,6 +440,7 @@ pub const Action = union(Key) {
         copy_title_to_clipboard,
         move_tab_to_new_window,
         resize_window,
+        broadcast_input,
 
         test "ghostty.h Action.Key" {
             try lib.checkGhosttyHEnum(Key, "GHOSTTY_ACTION_");
@@ -618,6 +623,18 @@ pub const SecureInput = enum(c_int) {
 
     test "ghostty.h SecureInput" {
         try lib.checkGhosttyHEnum(SecureInput, "GHOSTTY_SECURE_INPUT_");
+    }
+};
+
+/// Broadcast input mode. `all_tabs` and `current_tab` toggle: requesting
+/// the active mode turns broadcasting off.
+pub const BroadcastInput = enum(c_int) {
+    off,
+    current_tab,
+    all_tabs,
+
+    test "ghostty.h BroadcastInput" {
+        try lib.checkGhosttyHEnum(BroadcastInput, "GHOSTTY_BROADCAST_INPUT_");
     }
 };
 

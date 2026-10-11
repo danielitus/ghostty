@@ -211,6 +211,7 @@ pub const CommandPalette = extern struct {
         return switch (action) {
             .close_all_windows,
             .toggle_secure_input,
+            .toggle_broadcast_input,
             .check_for_updates,
             .redo,
             .undo,

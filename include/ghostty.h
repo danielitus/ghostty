@@ -679,6 +679,13 @@ typedef enum {
   GHOSTTY_SECURE_INPUT_TOGGLE,
 } ghostty_action_secure_input_e;
 
+// apprt.action.BroadcastInput
+typedef enum {
+  GHOSTTY_BROADCAST_INPUT_OFF,
+  GHOSTTY_BROADCAST_INPUT_CURRENT_TAB,
+  GHOSTTY_BROADCAST_INPUT_ALL_TABS,
+} ghostty_action_broadcast_input_e;
+
 // apprt.action.Inspector
 typedef enum {
   GHOSTTY_INSPECTOR_TOGGLE,
@@ -1016,6 +1023,7 @@ typedef enum {
   GHOSTTY_ACTION_COPY_TITLE_TO_CLIPBOARD,
   GHOSTTY_ACTION_MOVE_TAB_TO_NEW_WINDOW,
   GHOSTTY_ACTION_RESIZE_WINDOW,
+  GHOSTTY_ACTION_BROADCAST_INPUT,
 } ghostty_action_tag_e;
 
 typedef union {
@@ -1045,6 +1053,7 @@ typedef union {
   ghostty_action_quit_timer_e quit_timer;
   ghostty_action_float_window_e float_window;
   ghostty_action_secure_input_e secure_input;
+  ghostty_action_broadcast_input_e broadcast_input;
   ghostty_action_key_sequence_s key_sequence;
   ghostty_action_key_table_s key_table;
   ghostty_action_color_change_s color_change;

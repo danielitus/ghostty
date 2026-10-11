@@ -5894,6 +5894,16 @@ pub fn performBindingAction(self: *Surface, action: input.Binding.Action) !bool 
             .toggle,
         ),
 
+        .toggle_broadcast_input => |mode| return try self.rt_app.performAction(
+            .{ .surface = self },
+            .broadcast_input,
+            switch (mode) {
+                .all_tabs => .all_tabs,
+                .current_tab => .current_tab,
+                .off => .off,
+            },
+        ),
+
         .toggle_mouse_reporting => {
             self.config.mouse_reporting = !self.config.mouse_reporting;
             log.debug("mouse reporting toggled: {}", .{self.config.mouse_reporting});

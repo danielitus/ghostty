@@ -62,6 +62,10 @@ class BaseTerminalController: NSWindowController,
     /// True when any surface in this controller currently has an active bell.
     @Published private(set) var bell: Bool = false
 
+    /// The broadcast input mode set on this tab. Use
+    /// `BroadcastInput.effectiveMode(for:)` for what is actually in effect.
+    var broadcastInputMode: BroadcastInput.Mode = .off
+
     /// Whether the terminal surface should focus when the mouse is over it.
     var focusFollowsMouse: Bool {
         self.derivedConfig.focusFollowsMouse
@@ -343,6 +347,9 @@ class BaseTerminalController: NSWindowController,
             focusedSurface = nil
         }
         syncSurfaceTreeOcclusionState()
+
+        // New splits join (and closed ones leave) an active broadcast.
+        BroadcastInput.refreshIndicators(for: self)
     }
 
     /// Update all surfaces with the focus state. This ensures that libghostty has an accurate view about
@@ -1270,6 +1277,10 @@ class BaseTerminalController: NSWindowController,
         DispatchQueue.main.async {
             self.syncFocusToSurfaceTree()
         }
+
+        // Tabs opened or moved while broadcasting to all tabs pick up the
+        // indicator here, once they belong to their tab group.
+        BroadcastInput.refreshIndicators(for: self)
     }
 
     func windowDidResignKey(_ notification: Notification) {
@@ -1426,6 +1437,21 @@ class BaseTerminalController: NSWindowController,
         ghostty.changeFontSize(surface: surface, .reset)
     }
 
+    @IBAction func toggleBroadcastInputAllTabs(_ sender: Any?) {
+        guard let focusedSurface else { return }
+        BroadcastInput.toggle(.allTabs, from: focusedSurface)
+    }
+
+    @IBAction func toggleBroadcastInputCurrentTab(_ sender: Any?) {
+        guard let focusedSurface else { return }
+        BroadcastInput.toggle(.currentTab, from: focusedSurface)
+    }
+
+    @IBAction func stopBroadcastInput(_ sender: Any?) {
+        guard let focusedSurface else { return }
+        BroadcastInput.toggle(.off, from: focusedSurface)
+    }
+
     @IBAction func toggleCommandPalette(_ sender: Any?) {
         commandPaletteIsShowing.toggle()
         if commandPaletteIsShowing {
@@ -1501,6 +1527,18 @@ extension BaseTerminalController: NSMenuItemValidation {
         switch item.action {
         case #selector(findHide):
             return focusedSurface?.searchState != nil
+
+        case #selector(toggleBroadcastInputAllTabs(_:)):
+            item.state = BroadcastInput.effectiveMode(for: self) == .allTabs ? .on : .off
+            return focusedSurface != nil
+
+        case #selector(toggleBroadcastInputCurrentTab(_:)):
+            item.state = BroadcastInput.effectiveMode(for: self) == .currentTab ? .on : .off
+            return focusedSurface != nil
+
+        case #selector(stopBroadcastInput(_:)):
+            item.state = BroadcastInput.effectiveMode(for: self) == .off ? .on : .off
+            return focusedSurface != nil
 
         default:
             return true

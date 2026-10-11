@@ -109,6 +109,23 @@ extension Ghostty {
         /// True when the bell is active. This is set inactive on focus or event.
         @Published private(set) var bell: Bool = false
 
+        /// True while input typed into this surface's tab (or window) is being
+        /// broadcast. Maintained by `BroadcastInput`; drives the indicator.
+        @Published var broadcastInputActive: Bool = false
+
+        /// Set while a keybind or paste menu action runs on this surface with
+        /// broadcasting active, so a clipboard paste it triggers is forwarded
+        /// to the peers too. See `Ghostty.App.readClipboard`.
+        var broadcastPasteArmed: Bool = false
+
+        /// Set when an armed paste needed confirmation; the confirmation then
+        /// forwards it instead of `readClipboard`.
+        var broadcastPasteDeferred: Bool = false
+
+        /// Keycodes whose press was broadcast, so their release is too (and
+        /// releases of keybind presses are not).
+        private var broadcastPressedKeys: Set<UInt32> = []
+
         /// A clipboard confirmation waiting to be handled by its controller.
         @Published var pendingClipboardConfirmation: ClipboardConfirmationRequest? {
             didSet {
@@ -1509,13 +1526,59 @@ extension Ghostty {
             var key_ev = event.ghosttyKeyEvent(action, translationMods: translationEvent?.modifierFlags)
             key_ev.composing = composing
 
+            let broadcasting = broadcastInputActive && !BroadcastInput.peers(of: self).isEmpty
+            if !broadcasting && !broadcastPressedKeys.isEmpty {
+                // Broadcasting ended with keys held; their peers' releases are lost.
+                broadcastPressedKeys.removeAll()
+            }
+            let send = { (ev: ghostty_input_key_s) -> Bool in
+                broadcasting
+                    ? self.broadcastingKeyAction(surface, ev)
+                    : ghostty_surface_key(surface, ev)
+            }
+
             if let text = text?.keyEventText {
                 return text.withCString { ptr in
                     key_ev.text = ptr
-                    return ghostty_surface_key(surface, key_ev)
+                    return send(key_ev)
                 }
             } else {
-                return ghostty_surface_key(surface, key_ev)
+                return send(key_ev)
+            }
+        }
+
+        /// Deliver a key event to this surface and mirror it to the broadcast
+        /// peers. Keybinds run only here; a paste they trigger is forwarded
+        /// via `broadcastPasteArmed`.
+        private func broadcastingKeyAction(_ surface: ghostty_surface_t, _ ev: ghostty_input_key_s) -> Bool {
+            // Check before delivering: delivery can change key table state.
+            var flags = ghostty_binding_flags_e(0)
+            let isBinding = ev.action != GHOSTTY_ACTION_RELEASE &&
+                ghostty_surface_key_is_binding(surface, ev, &flags)
+
+            broadcastPasteArmed = isBinding
+            defer { broadcastPasteArmed = false }
+            let handled = ghostty_surface_key(surface, ev)
+
+            if ev.action == GHOSTTY_ACTION_RELEASE {
+                if broadcastPressedKeys.remove(ev.keycode) != nil {
+                    BroadcastInput.broadcastKey(ev, from: self)
+                }
+            } else if !isBinding {
+                broadcastPressedKeys.insert(ev.keycode)
+                BroadcastInput.broadcastKey(ev, from: self)
+            }
+
+            return handled
+        }
+
+        /// Run a paste action, forwarding the pasted text to broadcast peers.
+        private func performPasteAction(_ action: String) {
+            guard let surface = self.surface else { return }
+            broadcastPasteArmed = broadcastInputActive
+            defer { broadcastPasteArmed = false }
+            if !ghostty_surface_binding_action(surface, action, UInt(action.lengthOfBytes(using: .utf8))) {
+                AppDelegate.logger.warning("action failed action=\(action, privacy: .public)")
             }
         }
 
@@ -1550,7 +1613,11 @@ extension Ghostty {
 
             return text.withCString { ptr in
                 key_ev.text = ptr
-                return ghostty_surface_key(surface, key_ev)
+                let handled = ghostty_surface_key(surface, key_ev)
+                if broadcastInputActive {
+                    BroadcastInput.broadcastKey(key_ev, from: self)
+                }
+                return handled
             }
         }
 
@@ -1667,27 +1734,15 @@ extension Ghostty {
         }
 
         @IBAction func paste(_ sender: Any?) {
-            guard let surface = self.surface else { return }
-            let action = "paste_from_clipboard"
-            if !ghostty_surface_binding_action(surface, action, UInt(action.lengthOfBytes(using: .utf8))) {
-                AppDelegate.logger.warning("action failed action=\(action, privacy: .public)")
-            }
+            performPasteAction("paste_from_clipboard")
         }
 
         @IBAction func pasteAsPlainText(_ sender: Any?) {
-            guard let surface = self.surface else { return }
-            let action = "paste_from_clipboard"
-            if !ghostty_surface_binding_action(surface, action, UInt(action.lengthOfBytes(using: .utf8))) {
-                AppDelegate.logger.warning("action failed action=\(action, privacy: .public)")
-            }
+            performPasteAction("paste_from_clipboard")
         }
 
         @IBAction func pasteSelection(_ sender: Any?) {
-            guard let surface = self.surface else { return }
-            let action = "paste_from_selection"
-            if !ghostty_surface_binding_action(surface, action, UInt(action.lengthOfBytes(using: .utf8))) {
-                AppDelegate.logger.warning("action failed action=\(action, privacy: .public)")
-            }
+            performPasteAction("paste_from_selection")
         }
 
         @IBAction override func selectAll(_ sender: Any?) {

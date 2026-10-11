@@ -667,6 +667,24 @@ fn actionCommands(action: Action.Key) []const Command {
             .description = i18n.N_("Toggle secure input mode."),
         }},
 
+        .toggle_broadcast_input => comptime &.{
+            .{
+                .action = .{ .toggle_broadcast_input = .all_tabs },
+                .title = i18n.N_("Toggle Broadcast Input to All Tabs"),
+                .description = i18n.N_("Send input to every split in every tab of the current window."),
+            },
+            .{
+                .action = .{ .toggle_broadcast_input = .current_tab },
+                .title = i18n.N_("Toggle Broadcast Input to Current Tab"),
+                .description = i18n.N_("Send input to every split in the current tab."),
+            },
+            .{
+                .action = .{ .toggle_broadcast_input = .off },
+                .title = i18n.N_("Stop Broadcasting Input"),
+                .description = i18n.N_("Send input to the focused terminal only."),
+            },
+        },
+
         .toggle_mouse_reporting => comptime &.{.{
             .action = .toggle_mouse_reporting,
             .title = i18n.N_("Toggle Mouse Reporting"),

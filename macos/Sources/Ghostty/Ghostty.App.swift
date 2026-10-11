@@ -339,11 +339,23 @@ extension Ghostty {
                 return GHOSTTY_CLIPBOARD_READ_UNAVAILABLE
             }
 
+            surfaceView.broadcastPasteDeferred = false
             completeClipboardRequest(
                 surface,
                 contents: contents,
                 available: available,
                 state: state)
+
+            // A paste triggered by the user while broadcasting goes to the
+            // peers too, unless it is waiting on confirmation (then the
+            // confirmation forwards it). Only user actions arm this, so
+            // program-initiated reads (OSC 52) are never forwarded.
+            if surfaceView.broadcastPasteArmed && !surfaceView.broadcastPasteDeferred,
+               let text = contents.plainText {
+                MainActor.assumeIsolated {
+                    BroadcastInput.broadcastPaste(text, from: surfaceView)
+                }
+            }
             return GHOSTTY_CLIPBOARD_READ_STARTED
         }
 
@@ -361,6 +373,10 @@ extension Ghostty {
                 return
             }
             let c = confirm.pointee
+
+            // An armed paste needing confirmation is forwarded once confirmed.
+            let broadcastPaste = kind == .paste && surfaceView.broadcastPasteArmed
+            if broadcastPaste { surfaceView.broadcastPasteDeferred = true }
 
             // Copy the borrowed C representations: the confirmation is
             // asynchronous and completes with exactly what the user
@@ -417,6 +433,11 @@ extension Ghostty {
                         state: state,
                         confirmed: true,
                         remember: remember)
+                    if broadcastPaste, let text = reps.plainText {
+                        MainActor.assumeIsolated {
+                            BroadcastInput.broadcastPaste(text, from: surfaceView)
+                        }
+                    }
                 } else {
                     ghostty_surface_deny_clipboard_request(surface, state)
                 }
@@ -673,6 +694,9 @@ extension Ghostty {
 
             case GHOSTTY_ACTION_SECURE_INPUT:
                 toggleSecureInput(app, target: target, mode: action.action.secure_input)
+
+            case GHOSTTY_ACTION_BROADCAST_INPUT:
+                toggleBroadcastInput(app, target: target, mode: action.action.broadcast_input)
 
             case GHOSTTY_ACTION_MOUSE_SHAPE:
                 setMouseShape(app, target: target, shape: action.action.mouse_shape)
@@ -1125,6 +1149,27 @@ extension Ghostty {
                         Notification.FullscreenModeKey: mode,
                     ]
                 )
+
+            default:
+                assertionFailure()
+            }
+        }
+
+        private static func toggleBroadcastInput(
+            _ app: ghostty_app_t,
+            target: ghostty_target_s,
+            mode: ghostty_action_broadcast_input_e) {
+            switch target.tag {
+            case GHOSTTY_TARGET_APP:
+                Ghostty.logger.warning("broadcast input does nothing with an app target")
+                return
+
+            case GHOSTTY_TARGET_SURFACE:
+                guard let surface = target.target.surface else { return }
+                guard let surfaceView = self.surfaceView(from: surface) else { return }
+                MainActor.assumeIsolated {
+                    BroadcastInput.toggle(.init(mode), from: surfaceView)
+                }
 
             default:
                 assertionFailure()
