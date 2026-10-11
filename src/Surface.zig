@@ -2741,11 +2741,9 @@ fn resize(self: *Surface, size: rendererpkg.ScreenSize) !void {
     self.queueIo(.{ .resize = self.size }, .unlocked);
 
     // Mail the render thread so it updates its padding and screen size.
-    _ = self.renderer_thread.mailbox.push(
-        global.io(),
-        .{ .resize = self.size },
-        .forever,
-    );
+    // Bounded: a live resize must never block the main thread behind a
+    // wedged renderer. An undelivered size is kept and replayed.
+    _ = self.pushRendererMessage(.{ .resize = self.size });
     self.queueRender() catch |err| {
         log.warn("failed to notify renderer of resize err={}", .{err});
     };
@@ -3549,6 +3547,7 @@ const RendererPending = struct {
     visible: ?bool = null,
     focus: ?bool = null,
     macos_display_id: ?u32 = null,
+    resize: ?rendererpkg.Size = null,
     change_config: ?rendererpkg.Message = null,
     font_grid: ?rendererpkg.Message = null,
 
@@ -3556,6 +3555,7 @@ const RendererPending = struct {
         return self.visible == null and
             self.focus == null and
             self.macos_display_id == null and
+            self.resize == null and
             self.change_config == null and
             self.font_grid == null;
     }
@@ -3625,6 +3625,7 @@ fn supersedePendingRendererMessage(self: *Surface, msg: rendererpkg.Message) voi
         .visible => p.visible = null,
         .focus => p.focus = null,
         .macos_display_id => p.macos_display_id = null,
+        .resize => p.resize = null,
         .change_config => if (p.change_config) |old| {
             old.deinit();
             p.change_config = null;
@@ -3644,6 +3645,7 @@ fn deferRendererMessage(self: *Surface, msg: rendererpkg.Message) void {
         .visible => |v| p.visible = v,
         .focus => |v| p.focus = v,
         .macos_display_id => |v| p.macos_display_id = v,
+        .resize => |v| p.resize = v,
         .change_config => p.change_config = msg,
         .font_grid => p.font_grid = msg,
         // Inspector toggles only set a flag the render thread doesn't
@@ -3653,7 +3655,7 @@ fn deferRendererMessage(self: *Surface, msg: rendererpkg.Message) void {
 }
 
 /// Retry deferred messages in a fixed order (config before font grid,
-/// then display, visibility, focus). Stops at the first failure so
+/// then size, display, visibility, focus). Stops at the first failure so
 /// ordering between kinds is preserved. Returns true once nothing is
 /// pending any more.
 fn flushPendingRendererMessages(self: *Surface) bool {
@@ -3671,6 +3673,11 @@ fn flushPendingRendererMessages(self: *Surface) bool {
         self.applyFontGrid(msg.font_grid.grid) catch |err| {
             log.warn("error applying deferred font grid err={}", .{err});
         };
+    }
+
+    if (p.resize) |size| {
+        if (!self.tryPushRendererMessage(.{ .resize = size })) return false;
+        p.resize = null;
     }
 
     if (p.macos_display_id) |id| {
