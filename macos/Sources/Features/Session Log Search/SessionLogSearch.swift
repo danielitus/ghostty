@@ -96,15 +96,17 @@ enum SessionLogSearch {
             let bytes = raw.bindMemory(to: UInt8.self)
             var stripper = Stripper()
             var lineNumber = 1
-            var matched = false
-            // A hit found on a long line before its end, and the visible
+            // A hit found on a long line before its end, and the line
             // length it needs: later backspaces can still erase it, so it
-            // only counts if the line keeps that much text.
+            // only counts if the line still reaches that far at its end.
             var provisional: Hit?
             var provisionalEnd = 0
             // Checked per byte instead of `provisional`, which would copy
             // the hit (URL and all) every time.
             var hasProvisional = false
+            // Visible bytes of this line trimmed from the front of the
+            // buffer, so `trimmed + visible.count` is the line's length.
+            var trimmed = 0
 
             for i in 0..<bytes.count {
                 // Bounded by bytes, not lines, so cancelling is prompt even
@@ -114,59 +116,50 @@ enum SessionLogSearch {
 
                 let c = bytes[i]
                 if c == 0x0A {
-                    if !matched {
-                        if let hit = provisional {
-                            hits.append(hit)
-                        } else if let found = find(matcher, in: visible, file: file, line: lineNumber) {
-                            hits.append(found.hit)
-                        }
-                        if hits.count >= limit { return }
+                    if let hit = provisional {
+                        hits.append(hit)
+                    } else if let found = find(matcher, in: visible, file: file, line: lineNumber) {
+                        hits.append(found.hit)
                     }
+                    if hits.count >= limit { return }
                     visible.removeAll(keepingCapacity: true)
                     stripper = Stripper()
-                    matched = false
                     provisional = nil
                     hasProvisional = false
+                    trimmed = 0
                     lineNumber += 1
                     continue
                 }
 
-                // The rest of a line with a confirmed hit only matters for
-                // finding the next newline.
-                if matched { continue }
-
                 stripper.feed(c, into: &visible)
-                if hasProvisional && visible.count < provisionalEnd {
+                if stripper.erasedBeforeBuffer > 0 {
+                    // Backspaces reaching into the trimmed part of the line.
+                    trimmed -= min(trimmed, stripper.erasedBeforeBuffer)
+                    stripper.erasedBeforeBuffer = 0
+                }
+                if hasProvisional && trimmed + visible.count < provisionalEnd {
                     provisional = nil
                     hasProvisional = false
                 }
 
                 guard visible.count >= capacity else { continue }
-                if hasProvisional {
-                    // Keep the hit's text until erasing it back that far is
-                    // implausible, then confirm it.
-                    if visible.count >= 2 * capacity, let hit = provisional {
-                        hits.append(hit)
-                        provisional = nil
-                        hasProvisional = false
-                        matched = true
-                        if hits.count >= limit { return }
-                    }
-                } else if let found = find(matcher, in: visible, file: file, line: lineNumber) {
+                if !hasProvisional,
+                   let found = find(matcher, in: visible, file: file, line: lineNumber) {
                     provisional = found.hit
-                    provisionalEnd = found.end
+                    provisionalEnd = trimmed + found.end
                     hasProvisional = true
-                } else {
-                    visible.removeFirst(visible.count - keep)
                 }
+                // The hit's text is already in `provisional`, so the buffer
+                // can be trimmed either way.
+                let removed = visible.count - keep
+                visible.removeFirst(removed)
+                trimmed += removed
             }
 
-            if !matched {
-                if let hit = provisional {
-                    hits.append(hit)
-                } else if let found = find(matcher, in: visible, file: file, line: lineNumber) {
-                    hits.append(found.hit)
-                }
+            if let hit = provisional {
+                hits.append(hit)
+            } else if let found = find(matcher, in: visible, file: file, line: lineNumber) {
+                hits.append(found.hit)
             }
         }
         return Array(hits.prefix(limit))
@@ -200,14 +193,24 @@ enum SessionLogSearch {
 
         private var state: State = .text
 
+        /// Backspaces that found the output empty, since the caller last
+        /// reset this.
+        var erasedBeforeBuffer = 0
+
         mutating func feed(_ c: UInt8, into out: inout [UInt8]) {
             switch state {
             case .text:
                 switch c {
                 case 0x1B: state = .escape
                 case 0x08:
-                    // Drop one whole UTF-8 character.
-                    while let last = out.popLast(), last & 0xC0 == 0x80 {}
+                    // Drop one whole UTF-8 character. With nothing left to
+                    // drop, the caller may have trimmed earlier text off the
+                    // front; count it so it can track the line's length.
+                    if out.isEmpty {
+                        erasedBeforeBuffer += 1
+                    } else {
+                        while let last = out.popLast(), last & 0xC0 == 0x80 {}
+                    }
                 case 0x09: out.append(c)
                 case 0x00..<0x20, 0x7F: break
                 default: out.append(c)

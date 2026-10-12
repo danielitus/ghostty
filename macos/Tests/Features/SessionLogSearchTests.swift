@@ -126,6 +126,25 @@ struct SessionLogSearchTests {
         #expect(try await searchSingleLog(log, for: "other").first?.hits.map(\.line) == [1])
     }
 
+    /// Erasure is honored however far past the match the line goes on
+    /// before the backspaces arrive.
+    @Test func longLineHitErasedFarLater() async throws {
+        let cap = SessionLogSearch.maxSegment
+        let log = String(repeating: "x", count: cap - 6) + "needle"
+            + String(repeating: "y", count: 2 * cap)
+            + String(repeating: "\u{08}", count: 2 * cap + 6) + "other\n"
+        #expect(try await searchSingleLog(log, for: "needle").isEmpty)
+        #expect(try await searchSingleLog(log, for: "other").first?.hits.map(\.line) == [1])
+    }
+
+    /// A hit that survives the rest of its long line still counts.
+    @Test func longLineHitKeptToLineEnd() async throws {
+        let cap = SessionLogSearch.maxSegment
+        let log = String(repeating: "x", count: cap - 6) + "needle"
+            + String(repeating: "y", count: 3 * cap) + "\u{08}\u{08}\n"
+        #expect(try await searchSingleLog(log, for: "needle").first?.hits.map(\.line) == [1])
+    }
+
     /// Matching stays linear on repetitive text with a near-miss query.
     @Test func repetitiveNearMissIsLinear() async throws {
         let query = String(repeating: "a", count: SessionLogSearch.maxQueryLength - 1) + "z"
