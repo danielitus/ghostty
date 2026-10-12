@@ -43,6 +43,15 @@ pre: std.ArrayList(u8) = .empty,
 /// the next input continues masking until the closing quote.
 open_quote: u8 = 0,
 
+/// Whether the last input ended inside that quoted value right after an
+/// escaping backslash, so the next input's first byte is escaped.
+open_escape: bool = false,
+
+/// Whether the last input was cut in the middle of a run of credential
+/// characters (see `redactCut`), so the run's start in this input is
+/// masked.
+mask_leading_run: bool = false,
+
 /// Upper bound on the lines of a PEM block. A 4096-bit RSA key is about
 /// 50 lines; encrypted keys add a few header lines.
 const max_pem_lines = 150;
@@ -59,6 +68,30 @@ pub fn redact(
     alloc: Allocator,
     out: *std.ArrayList(u8),
     input: []const u8,
+) Allocator.Error!void {
+    return self.redactImpl(alloc, out, input, false);
+}
+
+/// Like `redact`, for input that had to be cut in the middle of a run of
+/// credential characters because no safe cut point existed. Such a cut
+/// can split a token, URL password or value into halves that no pattern
+/// recognizes, so the run is masked on both sides of the cut: at the end
+/// of this input and at the start of the next.
+pub fn redactCut(
+    self: *Redact,
+    alloc: Allocator,
+    out: *std.ArrayList(u8),
+    input: []const u8,
+) Allocator.Error!void {
+    return self.redactImpl(alloc, out, input, true);
+}
+
+fn redactImpl(
+    self: *Redact,
+    alloc: Allocator,
+    out: *std.ArrayList(u8),
+    input: []const u8,
+    cut_mid_run: bool,
 ) Allocator.Error!void {
     // Control strings (OSC window titles, OSC 8 hyperlinks, DCS, APC)
     // aren't visible text but are kept in the log, and can carry secrets
@@ -92,17 +125,37 @@ pub fn redact(
 
     // Finish a quoted value continued from the last input.
     if (self.open_quote != 0) {
-        const end = quotedEnd(vis, 0, self.open_quote);
-        if (end > 0) {
+        const q = quotedEnd(vis, 0, self.open_quote, self.open_escape);
+        if (q.end > 0) {
             try out.appendSlice(alloc, "[REDACTED:secret]");
-            try e.dropTo(e.rawEnd(end));
+            try e.dropTo(e.rawEnd(q.end));
         }
         // Still open only if it ran to the end of this input too.
-        if (end < vis.len) self.open_quote = 0;
+        if (q.end < vis.len) {
+            self.open_quote = 0;
+            self.open_escape = false;
+        } else {
+            self.open_escape = q.escaped;
+        }
+        i = q.end;
+        self.mask_leading_run = false;
+    } else if (self.mask_leading_run) {
+        // The rest of a run the last input was cut through.
+        self.mask_leading_run = false;
+        var end: usize = 0;
+        while (end < vis.len and end < max_cut_mask and isCredChar(vis[end])) end += 1;
+        if (end > 0) {
+            try out.appendSlice(alloc, "[REDACTED:truncated]");
+            try e.dropTo(e.rawEnd(end));
+        }
         i = end;
     }
 
-    while (i < vis.len) {
+    // A forced cut through a run of credential characters: scan only up
+    // to the run, which is masked below.
+    const stop = if (cut_mid_run) trailingRun(vis) else vis.len;
+
+    while (i < stop) {
         if (self.pem_lines_left > 0) {
             // Mask key lines until the END marker. A line that can't be
             // key material (such as the next prompt) ends the block
@@ -141,7 +194,10 @@ pub fn redact(
         try out.print(alloc, "[REDACTED:{s}]", .{m.kind});
         try e.dropTo(e.rawEnd(m.end));
         i = m.end;
-        if (m.open_quote != 0) self.open_quote = m.open_quote;
+        if (m.open_quote != 0) {
+            self.open_quote = m.open_quote;
+            self.open_escape = m.open_escape;
+        }
 
         if (m.pem) {
             // Keep the rest of the BEGIN line, then mask what follows.
@@ -152,7 +208,40 @@ pub fn redact(
         }
     }
 
+    if (cut_mid_run and self.open_quote == 0 and stop < vis.len) {
+        // A match may already reach into the run; mask the rest of it,
+        // and the run's continuation in the next input.
+        if (i < vis.len) {
+            try e.passTo(e.rawIndex(i));
+            try out.appendSlice(alloc, "[REDACTED:truncated]");
+            try e.dropTo(raw.len);
+        }
+        self.mask_leading_run = true;
+    }
     try e.passTo(raw.len);
+}
+
+/// Characters that tokens, passwords in URLs and unquoted values are made
+/// of. A cut through a run of them may split a secret.
+pub fn isCredChar(c: u8) bool {
+    return isAlnum(c) or switch (c) {
+        '_', '-', '.', '+', '/', '=', '~', '%', '@', ':' => true,
+        else => false,
+    };
+}
+
+/// How far a mask around a forced cut reaches on each side. SessionLog
+/// holds back 4 KiB after such a cut, so this covers the held-back bytes
+/// plus a secret continuing past them. A secret longer than that, split
+/// by such a cut, can still leak its far end.
+const max_cut_mask = 8 * 1024;
+
+/// Start of the run of credential characters at the end of `s`, at most
+/// `max_cut_mask` back.
+fn trailingRun(s: []const u8) usize {
+    var i = s.len;
+    while (i > 0 and s.len - i < max_cut_mask and isCredChar(s[i - 1])) i -= 1;
+    return i;
 }
 
 fn isControlStringIntroducer(c: u8) bool {
@@ -277,8 +366,10 @@ const Match = struct {
     end: usize,
     kind: []const u8,
     pem: bool = false,
-    /// For a quoted value that runs to the end of the input: its quote.
+    /// For a quoted value that runs to the end of the input: its quote,
+    /// and whether it ended right after an escaping backslash.
     open_quote: u8 = 0,
+    open_escape: bool = false,
 };
 
 /// Index just past the newline ending the line that contains `i`, or the
@@ -582,13 +673,15 @@ fn assignment(s: []const u8, i: usize) ?Match {
     if (j < s.len and (s[j] == '"' or s[j] == '\'')) {
         const quote = s[j];
         const start = j + 1;
-        const e = quotedEnd(s, start, quote);
-        if (e == start or s[start] == '$') return null;
+        const q = quotedEnd(s, start, quote, false);
+        if (q.end == start and !q.escaped) return null;
+        if (start < s.len and s[start] == '$') return null;
         return .{
             .start = start,
-            .end = e,
+            .end = q.end,
             .kind = "secret",
-            .open_quote = if (e == s.len) quote else 0,
+            .open_quote = if (q.end == s.len) quote else 0,
+            .open_escape = q.escaped,
         };
     }
 
@@ -600,16 +693,31 @@ fn assignment(s: []const u8, i: usize) ?Match {
     return .{ .start = start, .end = j, .kind = "secret" };
 }
 
+const QuotedEnd = struct {
+    end: usize,
+    /// The value ran to the end of `s` right after an escaping backslash.
+    escaped: bool = false,
+};
+
 /// End of a quoted value starting at `start`: its closing quote (a
 /// backslash escapes the next character), the end of the line, or the
-/// end of `s`.
-fn quotedEnd(s: []const u8, start: usize, quote: u8) usize {
+/// end of `s`. `escaped` means the first byte is escaped, continuing a
+/// value whose previous input ended with a backslash.
+fn quotedEnd(s: []const u8, start: usize, quote: u8, escaped: bool) QuotedEnd {
     var e = start;
-    while (e < s.len and s[e] != quote and s[e] != '\n' and s[e] != '\r') {
-        if (s[e] == '\\' and e + 1 < s.len and s[e + 1] != '\n') e += 1;
+    if (escaped) {
+        if (e >= s.len) return .{ .end = s.len, .escaped = true };
+        if (s[e] == '\n' or s[e] == '\r') return .{ .end = e };
         e += 1;
     }
-    return @min(e, s.len);
+    while (e < s.len and s[e] != quote and s[e] != '\n' and s[e] != '\r') {
+        if (s[e] == '\\') {
+            if (e + 1 == s.len) return .{ .end = s.len, .escaped = true };
+            if (s[e + 1] != '\n') e += 1;
+        }
+        e += 1;
+    }
+    return .{ .end = @min(e, s.len) };
 }
 
 fn isBlank(c: u8) bool {
@@ -815,6 +923,44 @@ test "quoted value continues into the next input" {
     try r.redact(alloc, &out, "plain\n");
     try std.testing.expectEqualStrings(
         "PASSWORD=\"[REDACTED:secret][REDACTED:secret]\x1b[0m\" after\nplain\n",
+        out.items,
+    );
+}
+
+test "escaped quote split across inputs" {
+    const alloc = std.testing.allocator;
+    var r: Redact = .{};
+    defer r.deinit(alloc);
+    var out: std.ArrayList(u8) = .empty;
+    defer out.deinit(alloc);
+
+    // Cut between the backslash and the quote it escapes.
+    try r.redact(alloc, &out, "PASSWORD=\"abc\\");
+    try r.redact(alloc, &out, "\"LEAKMARKER\" after\n");
+    // Cut after a backslash that is itself escaped: the quote closes.
+    try r.redact(alloc, &out, "token=\"ab\\\\");
+    try r.redact(alloc, &out, "\" visible\n");
+    try std.testing.expect(std.mem.indexOf(u8, out.items, "LEAKMARKER") == null);
+    try std.testing.expectEqualStrings(
+        "PASSWORD=\"[REDACTED:secret][REDACTED:secret]\" after\n" ++
+            "token=\"[REDACTED:secret]\" visible\n",
+        out.items,
+    );
+}
+
+test "cut through a run masks both halves" {
+    const alloc = std.testing.allocator;
+    var r: Redact = .{};
+    defer r.deinit(alloc);
+    var out: std.ArrayList(u8) = .empty;
+    defer out.deinit(alloc);
+
+    try r.redactCut(alloc, &out, "keep this, xx:ghp_aBcDeFgHiJkLmNoPqR");
+    try r.redact(alloc, &out, "sTuVwXyZ0123456789:xx and the rest\n");
+    try std.testing.expect(std.mem.indexOf(u8, out.items, "aBcDeF") == null);
+    try std.testing.expect(std.mem.indexOf(u8, out.items, "0123456789") == null);
+    try std.testing.expectEqualStrings(
+        "keep this, [REDACTED:truncated][REDACTED:truncated] and the rest\n",
         out.items,
     );
 }

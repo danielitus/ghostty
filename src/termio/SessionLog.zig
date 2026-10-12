@@ -90,9 +90,14 @@ pub fn write(self: *SessionLog, bytes: []const u8) void {
     const alloc = self.alloc.?;
     self.pending.appendSlice(alloc, bytes) catch return self.fail(error.OutOfMemory);
 
-    const cut = cutPoint(self.pending.items, max_pending, hard_max_pending);
+    const c = cutPoint(self.pending.items, max_pending, hard_max_pending);
+    const cut = c.at;
     if (cut == 0) return;
-    self.logRedacted(self.pending.items[0..cut]);
+    if (c.mid_run) {
+        self.logRedactedCut(self.pending.items[0..cut]);
+    } else {
+        self.logRedacted(self.pending.items[0..cut]);
+    }
 
     // Keep the remainder for the next write.
     const rest = self.pending.items.len - cut;
@@ -100,49 +105,71 @@ pub fn write(self: *SessionLog, bytes: []const u8) void {
     self.pending.shrinkRetainingCapacity(rest);
 }
 
-/// How much of `pending` can be redacted and logged now. 0 means wait for
-/// more output.
+const Cut = struct {
+    /// Bytes to log now; 0 means wait for more output.
+    at: usize,
+    /// The cut goes through a run of credential characters, so the
+    /// redactor must mask the run on both sides (see Redact.redactCut).
+    mid_run: bool = false,
+};
+
+/// How much of `pending` can be redacted and logged now.
 ///
 /// Everything up to the last newline, or once over `limit`, up to the
 /// last carriage return. Over `hard_limit` with neither, the last point
 /// no secret can straddle (see `lastSafeCut`). If there is none near the
-/// end, the final `holdback` bytes are kept for the next write: a
-/// prefixed token can't start inside an unbroken run of token
-/// characters, so a split earlier than that can't cut one, and the held
-/// bytes are seen again with what follows.
-fn cutPoint(pending: []const u8, limit: usize, hard_limit: usize) usize {
-    if (std.mem.lastIndexOfScalar(u8, pending, '\n')) |nl| return nl + 1;
-    if (pending.len < limit) return 0;
-    if (std.mem.lastIndexOfScalar(u8, pending, '\r')) |cr| return cr + 1;
-    if (pending.len < hard_limit) return 0;
+/// end, the start of the word holding the last `holdback` bytes, along
+/// with any `KEY=` or `Bearer` introducing it, so the held-back tail
+/// carries every secret it touches. A word too long to hold back is cut
+/// where it must be, with the run around the cut masked.
+fn cutPoint(pending: []const u8, limit: usize, hard_limit: usize) Cut {
+    if (std.mem.lastIndexOfScalar(u8, pending, '\n')) |nl| return .{ .at = nl + 1 };
+    if (pending.len < limit) return .{ .at = 0 };
+    if (std.mem.lastIndexOfScalar(u8, pending, '\r')) |cr| return .{ .at = cr + 1 };
+    if (pending.len < hard_limit) return .{ .at = 0 };
 
     // A safe cut far from the end would leave nearly a full buffer to be
-    // rescanned on every write; hold back a bounded tail instead.
+    // rescanned on every write.
+    const max_tail = @max(hard_limit / 2, holdback);
     const safe = lastSafeCut(pending);
-    if (pending.len <= holdback) return safe orelse pending.len;
+    if (pending.len <= holdback) return .{ .at = safe orelse pending.len };
     if (safe) |cut| {
-        if (pending.len - cut <= @max(hard_limit / 2, holdback)) return cut;
+        if (pending.len - cut <= max_tail) return .{ .at = cut };
     }
 
-    // Prefer a blank in the stretch before the held-back tail, where no
-    // token can be cut and no value parted from its introducer. A cut
-    // inside a quoted value is safe either way: the redactor carries an
-    // open quote into the next write.
-    const fallback = pending.len - holdback;
-    const lower = fallback -| holdback;
-    var j = fallback;
-    while (j > lower and j > 1) {
-        if (pending[j - 1] != ' ' and pending[j - 1] != '\t') {
-            j -= 1;
-            continue;
-        }
-        // Every blank in this run follows the same visible byte.
-        const k = lastNonBlank(pending, j - 1);
-        if (introducerSafe(pending, k)) return j;
-        j = k orelse break;
+    // Back to the start of the word around the fallback point (escape
+    // sequences count as part of a word, since the redactor matches
+    // across them), then of the introducer before it, if any. A cut
+    // inside a quoted value is fine: the redactor carries it over.
+    var fallback = pending.len - holdback;
+    const floor = pending.len - max_tail;
+    var w = fallback;
+    while (true) {
+        while (w > floor and isWordByte(pending[w - 1])) w -= 1;
+        if (w <= floor) break;
+        const k = lastNonBlank(pending, w) orelse return .{ .at = w };
+        if (introducerSafe(pending, k)) return .{ .at = w };
+        w = k + 1;
     }
-    return fallback;
+
+    // One word longer than the tail: cut it, but not inside an escape
+    // sequence, and have the redactor mask around the cut.
+    var e = fallback -| 64;
+    while (std.mem.indexOfScalarPos(u8, pending[0..fallback], e, 0x1b)) |esc| {
+        if (Redact.skipEscape(pending, esc) > fallback) {
+            fallback = esc;
+            break;
+        }
+        e = esc + 1;
+    }
+    return .{
+        .at = fallback,
+        .mid_run = Redact.isCredChar(pending[fallback - 1]) and
+            Redact.isCredChar(pending[fallback]),
+    };
 }
+
+const holdback = 4 * 1024;
 
 /// Index of the last byte before `end` that isn't a blank, if any.
 fn lastNonBlank(s: []const u8, end: usize) ?usize {
@@ -154,7 +181,11 @@ fn lastNonBlank(s: []const u8, end: usize) ?usize {
     return null;
 }
 
-const holdback = 4 * 1024;
+/// Bytes that belong to a word: anything but blanks and control
+/// characters, with ESC included so escape sequences stay with the word.
+fn isWordByte(c: u8) bool {
+    return c == 0x1b or (c > ' ' and c != 0x7f);
+}
 
 /// The last index at which `s` can be split without splitting a secret,
 /// found in one forward pass: before an escape sequence that doesn't
@@ -218,6 +249,14 @@ fn introducerSafe(s: []const u8, last: ?usize) bool {
     const word = "bearer";
     if (l + 1 >= word.len and std.ascii.eqlIgnoreCase(s[l + 1 - word.len .. l + 1], word)) return false;
     return true;
+}
+
+fn logRedactedCut(self: *SessionLog, bytes: []const u8) void {
+    const alloc = self.alloc.?;
+    self.scratch.clearRetainingCapacity();
+    self.redact.?.redactCut(alloc, &self.scratch, bytes) catch
+        return self.fail(error.OutOfMemory);
+    self.writeFile(self.scratch.items);
 }
 
 fn logRedacted(self: *SessionLog, bytes: []const u8) void {
@@ -402,34 +441,36 @@ test "disabled log ignores writes" {
 
 test "cutPoint" {
     // Complete lines are logged, the partial line waits.
-    try std.testing.expectEqual(@as(usize, 5), cutPoint("ab\nc\nde", 4, 8));
-    try std.testing.expectEqual(@as(usize, 0), cutPoint("$ ", 4, 8));
+    try std.testing.expectEqual(@as(usize, 5), cutPoint("ab\nc\nde", 4, 8).at);
+    try std.testing.expectEqual(@as(usize, 0), cutPoint("$ ", 4, 8).at);
     // Over the soft limit: after a carriage return, else keep waiting.
-    try std.testing.expectEqual(@as(usize, 4), cutPoint("abc\rdef ghi", 4, 64));
-    try std.testing.expectEqual(@as(usize, 0), cutPoint("abc def ghi", 4, 64));
+    try std.testing.expectEqual(@as(usize, 4), cutPoint("abc\rdef ghi", 4, 64).at);
+    try std.testing.expectEqual(@as(usize, 0), cutPoint("abc def ghi", 4, 64).at);
     // Over the hard limit: whitespace or before an escape.
-    try std.testing.expectEqual(@as(usize, 8), cutPoint("abc def ghi", 4, 8));
-    try std.testing.expectEqual(@as(usize, 4), cutPoint("abc \x1b[0mdefghi", 4, 8));
-    try std.testing.expectEqual(@as(usize, 6), cutPoint("abcdef", 4, 4));
+    try std.testing.expectEqual(@as(usize, 8), cutPoint("abc def ghi", 4, 8).at);
+    try std.testing.expectEqual(@as(usize, 4), cutPoint("abc \x1b[0mdefghi", 4, 8).at);
+    try std.testing.expectEqual(@as(usize, 6), cutPoint("abcdef", 4, 4).at);
 }
 
 test "cutPoint never splits a secret" {
     // Not between a value and its introducer.
-    try std.testing.expectEqual(@as(usize, 2), cutPoint("x PASSWORD= secret123", 4, 8));
-    try std.testing.expectEqual(@as(usize, 6), cutPoint("x abc Bearer abcdef", 4, 8));
+    try std.testing.expectEqual(@as(usize, 2), cutPoint("x PASSWORD= secret123", 4, 8).at);
+    try std.testing.expectEqual(@as(usize, 6), cutPoint("x abc Bearer abcdef", 4, 8).at);
     // Not inside a quoted value, escaped quotes included.
-    try std.testing.expectEqual(@as(usize, 2), cutPoint("x PASSWORD=\"correct horse battery staple", 4, 8));
-    try std.testing.expectEqual(@as(usize, 2), cutPoint("x PASSWORD=\"abc\\\" tail", 4, 8));
+    try std.testing.expectEqual(@as(usize, 2), cutPoint("x PASSWORD=\"correct horse battery staple", 4, 8).at);
+    try std.testing.expectEqual(@as(usize, 2), cutPoint("x PASSWORD=\"abc\\\" tail", 4, 8).at);
     // An apostrophe in prose doesn't open a quote.
-    try std.testing.expectEqual(@as(usize, 11), cutPoint("don't stop now", 4, 8));
+    try std.testing.expectEqual(@as(usize, 11), cutPoint("don't stop now", 4, 8).at);
     // Not inside a token broken up by an escape sequence.
-    try std.testing.expectEqual(@as(usize, 2), cutPoint("x ghp_\x1b[0mabcdef", 4, 8));
+    try std.testing.expectEqual(@as(usize, 2), cutPoint("x ghp_\x1b[0mabcdef", 4, 8).at);
 }
 
 test "cutPoint holds back a tail when no point is safe" {
     const run = "x" ** (3 * holdback);
     const buf = run ++ ":ghp_aBcDeF";
-    try std.testing.expectEqual(buf.len - holdback, cutPoint(buf, 4, 8));
+    const c = cutPoint(buf, 4, 8);
+    try std.testing.expectEqual(buf.len - holdback, c.at);
+    try std.testing.expect(c.mid_run);
 }
 
 test "cutPoint is linear in the buffer size" {
@@ -440,7 +481,7 @@ test "cutPoint is linear in the buffer size" {
     defer alloc.free(buf);
     @memset(buf, ' ');
     @memcpy(buf[0..3], "x=\"");
-    try std.testing.expectEqual(buf.len - holdback, cutPoint(buf, max_pending, hard_max_pending));
+    try std.testing.expectEqual(buf.len - holdback, cutPoint(buf, max_pending, hard_max_pending).at);
 }
 
 test "redacted log keeps a long line whole up to the hard limit" {
@@ -491,12 +532,44 @@ test "redacted log never splits a secret at the hard limit" {
     const entry = (try it.next(io)).?;
     const contents = try tmp.dir.readFileAlloc(io, entry.name, alloc, .unlimited);
     defer alloc.free(contents);
-    try std.testing.expect(std.mem.indexOf(u8, contents, "ghp_") == null);
-    try std.testing.expect(std.mem.indexOf(u8, contents, "secret\"") == null);
-    try std.testing.expect(std.mem.indexOf(u8, contents, ":[REDACTED:github-token] PASSWORD=\"[REDACTED:secret]") != null);
+    // No part of the token or the value survives.
+    for ([_][]const u8{ "ghp_", "aBcDeF", "PqRsTu", "0123456789", "secret\"", "abc" }) |part|
+        try std.testing.expect(std.mem.indexOf(u8, contents, part) == null);
+    try std.testing.expect(std.mem.indexOf(u8, contents, " PASSWORD=\"[REDACTED:secret]") != null);
     try std.testing.expect(std.mem.endsWith(u8, contents, "[REDACTED:secret]\"\n"));
     // Nothing of the value survives: only the filler before it.
     try std.testing.expect(std.mem.indexOf(u8, contents, "tail") == null);
+}
+
+test "redacted log masks a token cut inside one giant word" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    const io = std.testing.io;
+    const dir = try tmp.dir.realPathFileAlloc(io, ".", alloc);
+    defer alloc.free(dir);
+
+    // A complete token straddling `pending.len - holdback`, in a single
+    // write with no blank anywhere.
+    const token = "ghp_aBcDeFgHiJkLmNoPqRsTuVwXyZ0123456789";
+    const before = "x" ** (hard_max_pending - holdback - 21);
+    const after = "x" ** (holdback - token.len - 2 + 21);
+    const chunk = before ++ ":" ++ token ++ ":" ++ after;
+    try std.testing.expectEqual(hard_max_pending, chunk.len);
+
+    var s = try SessionLog.init(alloc, dir, true);
+    s.write(chunk);
+    s.write("\n");
+    s.deinit(alloc);
+
+    var it = tmp.dir.iterate();
+    const entry = (try it.next(io)).?;
+    const contents = try tmp.dir.readFileAlloc(io, entry.name, alloc, .unlimited);
+    defer alloc.free(contents);
+    try std.testing.expect(std.mem.indexOf(u8, contents, "ghp_") == null);
+    try std.testing.expect(std.mem.indexOf(u8, contents, "PqRsTu") == null);
+    try std.testing.expect(std.mem.indexOf(u8, contents, "0123456789") == null);
+    try std.testing.expect(std.mem.indexOf(u8, contents, "[REDACTED:truncated]") != null);
 }
 
 test "redacted log holds partial lines until complete" {
