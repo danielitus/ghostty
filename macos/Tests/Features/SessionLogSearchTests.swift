@@ -137,6 +137,17 @@ struct SessionLogSearchTests {
         #expect(try await searchSingleLog(log, for: "other").first?.hits.map(\.line) == [1])
     }
 
+    /// The same with multibyte characters erased after the buffer moved
+    /// past them: each backspace removes a character, not a byte.
+    @Test func longLineHitErasedThroughMultibyteText() async throws {
+        let cap = SessionLogSearch.maxSegment
+        let log = String(repeating: "x", count: cap - 6) + "needle"
+            + String(repeating: "é", count: cap)
+            + String(repeating: "\u{08}", count: cap + 6) + "other\n"
+        #expect(try await searchSingleLog(log, for: "needle").isEmpty)
+        #expect(try await searchSingleLog(log, for: "other").first?.hits.map(\.line) == [1])
+    }
+
     /// A hit that survives the rest of its long line still counts.
     @Test func longLineHitKeptToLineEnd() async throws {
         let cap = SessionLogSearch.maxSegment

@@ -97,16 +97,14 @@ enum SessionLogSearch {
             var stripper = Stripper()
             var lineNumber = 1
             // A hit found on a long line before its end, and the line
-            // length it needs: later backspaces can still erase it, so it
-            // only counts if the line still reaches that far at its end.
+            // length in characters it needs: later backspaces can still
+            // erase it, so it only counts if the line still reaches that
+            // far at its end.
             var provisional: Hit?
             var provisionalEnd = 0
             // Checked per byte instead of `provisional`, which would copy
             // the hit (URL and all) every time.
             var hasProvisional = false
-            // Visible bytes of this line trimmed from the front of the
-            // buffer, so `trimmed + visible.count` is the line's length.
-            var trimmed = 0
 
             for i in 0..<bytes.count {
                 // Bounded by bytes, not lines, so cancelling is prompt even
@@ -126,18 +124,12 @@ enum SessionLogSearch {
                     stripper = Stripper()
                     provisional = nil
                     hasProvisional = false
-                    trimmed = 0
                     lineNumber += 1
                     continue
                 }
 
                 stripper.feed(c, into: &visible)
-                if stripper.erasedBeforeBuffer > 0 {
-                    // Backspaces reaching into the trimmed part of the line.
-                    trimmed -= min(trimmed, stripper.erasedBeforeBuffer)
-                    stripper.erasedBeforeBuffer = 0
-                }
-                if hasProvisional && trimmed + visible.count < provisionalEnd {
+                if hasProvisional && stripper.lineCharacters < provisionalEnd {
                     provisional = nil
                     hasProvisional = false
                 }
@@ -146,14 +138,17 @@ enum SessionLogSearch {
                 if !hasProvisional,
                    let found = find(matcher, in: visible, file: file, line: lineNumber) {
                     provisional = found.hit
-                    provisionalEnd = trimmed + found.end
+                    // Characters up to the match's end: the line so far
+                    // minus what follows the match in the buffer.
+                    let after = visible[found.end...].reduce(0) { $0 + ($1 & 0xC0 == 0x80 ? 0 : 1) }
+                    provisionalEnd = stripper.lineCharacters - after
                     hasProvisional = true
                 }
                 // The hit's text is already in `provisional`, so the buffer
-                // can be trimmed either way.
-                let removed = visible.count - keep
+                // can be trimmed either way, at a character boundary.
+                var removed = visible.count - keep
+                while removed < visible.count && visible[removed] & 0xC0 == 0x80 { removed += 1 }
                 visible.removeFirst(removed)
-                trimmed += removed
             }
 
             if let hit = provisional {
@@ -193,9 +188,9 @@ enum SessionLogSearch {
 
         private var state: State = .text
 
-        /// Backspaces that found the output empty, since the caller last
-        /// reset this.
-        var erasedBeforeBuffer = 0
+        /// Visible characters of the line so far, including any the caller
+        /// trimmed off the front of the output. Backspace removes one.
+        private(set) var lineCharacters = 0
 
         mutating func feed(_ c: UInt8, into out: inout [UInt8]) {
             switch state {
@@ -203,17 +198,17 @@ enum SessionLogSearch {
                 switch c {
                 case 0x1B: state = .escape
                 case 0x08:
-                    // Drop one whole UTF-8 character. With nothing left to
-                    // drop, the caller may have trimmed earlier text off the
-                    // front; count it so it can track the line's length.
-                    if out.isEmpty {
-                        erasedBeforeBuffer += 1
-                    } else {
-                        while let last = out.popLast(), last & 0xC0 == 0x80 {}
-                    }
-                case 0x09: out.append(c)
+                    // Drop one whole UTF-8 character; it may already have
+                    // been trimmed off the front by the caller.
+                    if lineCharacters > 0 { lineCharacters -= 1 }
+                    while let last = out.popLast(), last & 0xC0 == 0x80 {}
+                case 0x09:
+                    out.append(c)
+                    lineCharacters += 1
                 case 0x00..<0x20, 0x7F: break
-                default: out.append(c)
+                default:
+                    out.append(c)
+                    if c & 0xC0 != 0x80 { lineCharacters += 1 }
                 }
             case .escape:
                 switch c {
