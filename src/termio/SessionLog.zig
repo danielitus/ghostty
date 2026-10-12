@@ -554,7 +554,8 @@ test "redacted log masks a token cut inside one giant word" {
 
     // A complete token straddling `pending.len - holdback`, in a single
     // write with no blank anywhere.
-    const token = "ghp_aBcDeFgHiJkLmNoPqRsTuVwXyZ0123456789";
+    // Assembled from pieces so secret scanners don't flag the fake token.
+    const token = "gh" ++ "p_" ++ "aBcDeFgHiJkLmNoPqRsTuVwXyZ0123456789";
     const before = "x" ** (hard_max_pending - holdback - 21);
     const after = "x" ** (holdback - token.len - 2 + 21);
     const chunk = before ++ ":" ++ token ++ ":" ++ after;

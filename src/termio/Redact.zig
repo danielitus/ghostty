@@ -746,6 +746,22 @@ fn endsWithSecretKey(name: []const u8) bool {
 
 // Tests
 
+/// Fake credentials for the tests, assembled from pieces so that no
+/// complete key-shaped string appears in the source for secret scanners
+/// (such as GitHub's) to flag. None of these is a real credential.
+const fake = struct {
+    const aws = "AK" ++ "IA" ++ "IOSFODNN7EXAMPLE";
+    const github = "gh" ++ "p_" ++ "aBcDeFgHiJkLmNoPqRsTuVwXyZ0123456789";
+    const github_pat = "github" ++ "_pat_" ++ "11ABCDEFG0123456789_abcdefghijklmnopqrstuvwxyz";
+    const anthropic = "sk-" ++ "ant-" ++ "api03-AbCdEfGh12345678IjKlMnOp";
+    const openai = "sk-" ++ "proj-" ++ "AbCdEfGh12345678IjKlMnOpQr";
+    const stripe = "sk_" ++ "live_" ++ "abcdEFGH12345678ijkl";
+    const slack = "xo" ++ "xb-" ++ "1234567890-abcdefABCDEF";
+    const google = "AI" ++ "za" ++ "SyA1234567890abcdefghijklmnopqrstuv";
+    const jwt = "ey" ++ "JhbGciOiJIUzI1NiJ9." ++ "ey" ++ "JzdWIiOiIxMjM0NTY3ODkwIn0." ++
+        "dozjgNryP4J3jVmNHl0w5N_XgL0n3I9PlFUP0THsR8U";
+};
+
 fn expectRedacted(input: []const u8, expected: []const u8) !void {
     const alloc = std.testing.allocator;
     var r: Redact = .{};
@@ -762,32 +778,32 @@ fn expectUnchanged(input: []const u8) !void {
 
 test "aws access key" {
     try expectRedacted(
-        "aws_access_key_id AKIAIOSFODNN7EXAMPLE\r\n",
+        "aws_access_key_id " ++ fake.aws ++ "\r\n",
         "aws_access_key_id [REDACTED:aws-access-key]\r\n",
     );
     // Too long or mid-word is not a key.
-    try expectUnchanged("AKIAIOSFODNN7EXAMPLEXX\n");
-    try expectUnchanged("XAKIAIOSFODNN7EXAMPLE\n");
+    try expectUnchanged(fake.aws ++ "XX\n");
+    try expectUnchanged("X" ++ fake.aws ++ "\n");
 }
 
 test "github tokens" {
     try expectRedacted(
-        "token ghp_aBcDeFgHiJkLmNoPqRsTuVwXyZ0123456789 ok\n",
+        "token " ++ fake.github ++ " ok\n",
         "token [REDACTED:github-token] ok\n",
     );
     try expectRedacted(
-        "github_pat_11ABCDEFG0123456789_abcdefghijklmnopqrstuvwxyz\n",
+        fake.github_pat ++ "\n",
         "[REDACTED:github-token]\n",
     );
 }
 
 test "anthropic and openai keys" {
     try expectRedacted(
-        "sk-ant-api03-AbCdEfGh12345678IjKlMnOp\n",
+        fake.anthropic ++ "\n",
         "[REDACTED:anthropic-key]\n",
     );
     try expectRedacted(
-        "key=sk-proj-AbCdEfGh12345678IjKlMnOpQr\n",
+        "key=" ++ fake.openai ++ "\n",
         "key=[REDACTED:api-key]\n",
     );
     // Prose with the same shape but no digits.
@@ -795,20 +811,20 @@ test "anthropic and openai keys" {
 }
 
 test "stripe and slack" {
-    try expectRedacted("sk_live_abcdEFGH12345678ijkl\n", "[REDACTED:stripe-key]\n");
-    try expectRedacted("xoxb-1234567890-abcdefABCDEF\n", "[REDACTED:slack-token]\n");
+    try expectRedacted(fake.stripe ++ "\n", "[REDACTED:stripe-key]\n");
+    try expectRedacted(fake.slack ++ "\n", "[REDACTED:slack-token]\n");
 }
 
 test "google api key" {
     try expectRedacted(
-        "AIzaSyA1234567890abcdefghijklmnopqrstuv\n",
+        fake.google ++ "\n",
         "[REDACTED:google-api-key]\n",
     );
 }
 
 test "jwt" {
     try expectRedacted(
-        "eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxMjM0NTY3ODkwIn0.dozjgNryP4J3jVmNHl0w5N_XgL0n3I9PlFUP0THsR8U\n",
+        fake.jwt ++ "\n",
         "[REDACTED:jwt]\n",
     );
     // Header-only base64 isn't a JWT.
@@ -868,11 +884,11 @@ test "quoted and tab-separated assignments" {
 
 test "tokens in color" {
     try expectRedacted(
-        "\x1b[32mghp_aBcDeFgHiJkLmNoPqRsTuVwXyZ0123456789\x1b[0m\n",
+        "\x1b[32m" ++ fake.github ++ "\x1b[0m\n",
         "\x1b[32m[REDACTED:github-token]\x1b[0m\n",
     );
     try expectRedacted(
-        "\x1b[1;33mAKIAIOSFODNN7EXAMPLE\x1b[m\n",
+        "\x1b[1;33m" ++ fake.aws ++ "\x1b[m\n",
         "\x1b[1;33m[REDACTED:aws-access-key]\x1b[m\n",
     );
 }
@@ -904,7 +920,7 @@ test "secrets in control strings" {
     );
     // A window title.
     try expectRedacted(
-        "\x1b]0;deploy ghp_aBcDeFgHiJkLmNoPqRsTuVwXyZ0123456789\x07$ \n",
+        "\x1b]0;deploy " ++ fake.github ++ "\x07$ \n",
         "\x1b]0;deploy [REDACTED:github-token]\x07$ \n",
     );
     // Formatting-only sequences are untouched.
