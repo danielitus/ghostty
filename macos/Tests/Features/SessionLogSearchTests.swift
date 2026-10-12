@@ -112,9 +112,39 @@ struct SessionLogSearchTests {
     /// A query longer than any fixed overlap still matches across the
     /// point where a long line's buffer is searched and trimmed.
     @Test func longQueryAcrossBufferBoundary() async throws {
-        let query = String(repeating: "A", count: 5_000) + "Z"
-        let log = String(repeating: "x", count: SessionLogSearch.maxSegment - 2_000) + query + "tail\n"
+        let query = String(repeating: "A", count: SessionLogSearch.maxQueryLength - 1) + "Z"
+        let log = String(repeating: "x", count: SessionLogSearch.maxSegment - 500) + query + "tail\n"
         #expect(try await searchSingleLog(log, for: query).first?.hits.map(\.line) == [1])
+    }
+
+    /// Text erased by backspaces after a long line's buffer was searched
+    /// is not a hit.
+    @Test func longLineHitErasedLater() async throws {
+        let log = String(repeating: "x", count: SessionLogSearch.maxSegment - 6)
+            + "needle" + String(repeating: "\u{08}", count: 6) + "other\n"
+        #expect(try await searchSingleLog(log, for: "needle").isEmpty)
+        #expect(try await searchSingleLog(log, for: "other").first?.hits.map(\.line) == [1])
+    }
+
+    /// Matching stays linear on repetitive text with a near-miss query.
+    @Test func repetitiveNearMissIsLinear() async throws {
+        let query = String(repeating: "a", count: SessionLogSearch.maxQueryLength - 1) + "z"
+        let log = String(repeating: "a", count: 2_000_000) + "\n"
+        let start = Date()
+        #expect(try await searchSingleLog(log, for: query).isEmpty)
+        #expect(Date().timeIntervalSince(start) < 5)
+    }
+
+    @Test func overlongQueryIsRejected() async throws {
+        let query = String(repeating: "a", count: SessionLogSearch.maxQueryLength + 1)
+        #expect(try await searchSingleLog(query + "\n", for: query).isEmpty)
+    }
+
+    @Test func matcherHandlesOverlaps() {
+        let needle = Array("abab".utf8)
+        #expect(SessionLogSearch.indexOf(needle, in: Array("aabababx".utf8)) == 1)
+        #expect(SessionLogSearch.indexOf(Array("aab".utf8), in: Array("aaab".utf8)) == 1)
+        #expect(SessionLogSearch.indexOf(Array("x".utf8), in: Array("ABX".utf8)) == 2)
     }
 
     @Test func shellQuote() {

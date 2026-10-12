@@ -168,6 +168,11 @@ struct SessionLogSearchView: View {
                 "Session Logging Is Off",
                 systemImage: "doc.text.magnifyingglass",
                 detail: "Set session-log-directory in your Ghostty config to record terminal output.")
+        } else if model.query.utf8.count > SessionLogSearch.maxQueryLength {
+            placeholder(
+                "Search Text Too Long",
+                systemImage: "magnifyingglass",
+                detail: "Search for at most \(SessionLogSearch.maxQueryLength) bytes of text.")
         } else if model.query.isEmpty {
             placeholder(
                 "Search Session Logs",

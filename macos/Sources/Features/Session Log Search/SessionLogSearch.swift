@@ -40,6 +40,9 @@ enum SessionLogSearch {
     /// Check for cancellation every this many bytes (1 MiB).
     static let cancelCheckMask = (1 << 20) - 1
 
+    /// Longest query searched for, in UTF-8 bytes.
+    static let maxQueryLength = 1024
+
     /// The log files in `directory`, newest first.
     static func logFiles(in directory: URL) -> [URL] {
         let keys: [URLResourceKey] = [.contentModificationDateKey, .isRegularFileKey]
@@ -60,7 +63,7 @@ enum SessionLogSearch {
     /// periodically within one.
     @concurrent static func search(_ query: String, in directory: URL) async -> [FileResult] {
         let needle = Array(query.utf8).map(lowerASCII)
-        guard !needle.isEmpty else { return [] }
+        guard !needle.isEmpty, needle.count <= maxQueryLength else { return [] }
 
         var results: [FileResult] = []
         var total = 0
@@ -88,63 +91,100 @@ enum SessionLogSearch {
         var visible: [UInt8] = []
         visible.reserveCapacity(capacity + 1)
 
+        let matcher = Matcher(needle)
         data.withUnsafeBytes { (raw: UnsafeRawBufferPointer) in
             let bytes = raw.bindMemory(to: UInt8.self)
             var stripper = Stripper()
             var lineNumber = 1
             var matched = false
+            // A hit found on a long line before its end, and the visible
+            // length it needs: later backspaces can still erase it, so it
+            // only counts if the line keeps that much text.
+            var provisional: Hit?
+            var provisionalEnd = 0
+            // Checked per byte instead of `provisional`, which would copy
+            // the hit (URL and all) every time.
+            var hasProvisional = false
 
             for i in 0..<bytes.count {
                 // Bounded by bytes, not lines, so cancelling is prompt even
-                // inside one enormous line.
+                // inside one enormous line. Matching work is bounded by the
+                // buffer, so this covers it too.
                 if i & cancelCheckMask == 0, i > 0, Task.isCancelled { return }
 
                 let c = bytes[i]
                 if c == 0x0A {
                     if !matched {
-                        record(needle, in: visible, file: file, line: lineNumber, into: &hits)
+                        if let hit = provisional {
+                            hits.append(hit)
+                        } else if let found = find(matcher, in: visible, file: file, line: lineNumber) {
+                            hits.append(found.hit)
+                        }
                         if hits.count >= limit { return }
                     }
                     visible.removeAll(keepingCapacity: true)
                     stripper = Stripper()
                     matched = false
+                    provisional = nil
+                    hasProvisional = false
                     lineNumber += 1
                     continue
                 }
 
-                // The rest of a line that already has a hit only matters
-                // for finding the next newline.
+                // The rest of a line with a confirmed hit only matters for
+                // finding the next newline.
                 if matched { continue }
 
                 stripper.feed(c, into: &visible)
-                if visible.count >= capacity {
-                    matched = record(needle, in: visible, file: file, line: lineNumber, into: &hits)
-                    if hits.count >= limit { return }
-                    if !matched { visible.removeFirst(visible.count - keep) }
+                if hasProvisional && visible.count < provisionalEnd {
+                    provisional = nil
+                    hasProvisional = false
+                }
+
+                guard visible.count >= capacity else { continue }
+                if hasProvisional {
+                    // Keep the hit's text until erasing it back that far is
+                    // implausible, then confirm it.
+                    if visible.count >= 2 * capacity, let hit = provisional {
+                        hits.append(hit)
+                        provisional = nil
+                        hasProvisional = false
+                        matched = true
+                        if hits.count >= limit { return }
+                    }
+                } else if let found = find(matcher, in: visible, file: file, line: lineNumber) {
+                    provisional = found.hit
+                    provisionalEnd = found.end
+                    hasProvisional = true
+                } else {
+                    visible.removeFirst(visible.count - keep)
                 }
             }
+
             if !matched {
-                record(needle, in: visible, file: file, line: lineNumber, into: &hits)
+                if let hit = provisional {
+                    hits.append(hit)
+                } else if let found = find(matcher, in: visible, file: file, line: lineNumber) {
+                    hits.append(found.hit)
+                }
             }
         }
         return Array(hits.prefix(limit))
     }
 
-    /// Append a hit if `visible` contains `needle`. Returns whether it did.
-    @discardableResult
-    private static func record(
-        _ needle: [UInt8],
+    /// A hit for the first match in `visible`, and the index just past it.
+    private static func find(
+        _ matcher: Matcher,
         in visible: [UInt8],
         file: URL,
-        line: Int,
-        into hits: inout [Hit]
-    ) -> Bool {
-        guard let at = indexOf(needle, in: visible) else { return false }
-        hits.append(.init(
+        line: Int
+    ) -> (hit: Hit, end: Int)? {
+        guard let at = matcher.firstIndex(in: visible) else { return nil }
+        let hit = Hit(
             file: file,
             line: line,
-            text: display(visible, matchAt: at, matchLength: needle.count)))
-        return true
+            text: display(visible, matchAt: at, matchLength: matcher.needle.count))
+        return (hit, at + matcher.needle.count)
     }
 
     // MARK: Escape stripping
@@ -218,26 +258,47 @@ enum SessionLogSearch {
     // MARK: Matching
 
     @inline(__always)
-    private static func lowerASCII(_ c: UInt8) -> UInt8 {
+    static func lowerASCII(_ c: UInt8) -> UInt8 {
         (0x41...0x5A).contains(c) ? c | 0x20 : c
     }
 
     /// First index of `needle` (already lowercased) in `haystack`, ignoring
     /// ASCII case.
     static func indexOf(_ needle: [UInt8], in haystack: [UInt8]) -> Int? {
-        guard needle.count <= haystack.count else { return nil }
-        let first = needle[0]
-        var i = 0
-        let last = haystack.count - needle.count
-        while i <= last {
-            if lowerASCII(haystack[i]) == first {
-                var k = 1
-                while k < needle.count && lowerASCII(haystack[i + k]) == needle[k] { k += 1 }
-                if k == needle.count { return i }
+        guard !needle.isEmpty else { return nil }
+        return Matcher(needle).firstIndex(in: haystack)
+    }
+
+    /// Knuth-Morris-Pratt matching of a lowercased needle, ignoring ASCII
+    /// case: linear in the text however repetitive it and the query are.
+    struct Matcher {
+        let needle: [UInt8]
+        /// For each prefix length, the length of its longest proper
+        /// prefix that is also a suffix.
+        private let fallback: [Int]
+
+        init(_ needle: [UInt8]) {
+            self.needle = needle
+            var fallback = [Int](repeating: 0, count: needle.count)
+            var k = 0
+            for i in 1..<max(needle.count, 1) {
+                while k > 0 && needle[i] != needle[k] { k = fallback[k - 1] }
+                if needle[i] == needle[k] { k += 1 }
+                fallback[i] = k
             }
-            i += 1
+            self.fallback = fallback
         }
-        return nil
+
+        func firstIndex(in haystack: [UInt8]) -> Int? {
+            var k = 0
+            for (i, raw) in haystack.enumerated() {
+                let c = SessionLogSearch.lowerASCII(raw)
+                while k > 0 && needle[k] != c { k = fallback[k - 1] }
+                if needle[k] == c { k += 1 }
+                if k == needle.count { return i - k + 1 }
+            }
+            return nil
+        }
     }
 
     /// The line as text, trimmed around the match when it is very long.
