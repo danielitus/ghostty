@@ -332,6 +332,7 @@ class AppDelegate: NSObject,
         // Setup our menu
         setupMenuImages()
         setupBroadcastInputMenu()
+        setupSessionLogSearchMenu()
 
         // Setup signal handlers
         setupSignals()
@@ -1023,6 +1024,10 @@ class AppDelegate: NSObject,
         PasswordManagerController.shared.toggle()
     }
 
+    @IBAction func showSessionLogSearch(_ sender: Any) {
+        SessionLogSearchController.shared.show(config: ghostty.config)
+    }
+
     @IBAction func toggleQuickTerminal(_ sender: Any) {
         quickController.toggle()
     }
@@ -1173,6 +1178,24 @@ extension AppDelegate {
         menuBroadcastCurrentTab = currentTab
         menuBroadcastOff = off
         syncMenuShortcuts(ghostty.config)
+    }
+
+    /// "Search Session Logs…" right after "Password Manager…" in the
+    /// app menu. No default shortcut: ⌥⌘F is the password manager's and
+    /// ⇧⌘F ends a search. It can be given one in System Settings.
+    @MainActor private func setupSessionLogSearchMenu() {
+        guard let appMenu = NSApp.mainMenu?.items.first?.submenu,
+              appMenu.items.allSatisfy({ $0.action != #selector(showSessionLogSearch(_:)) }),
+              let anchor = appMenu.items.firstIndex(where: {
+                  $0.action == #selector(togglePasswordManager(_:))
+              }) else { return }
+        let item = NSMenuItem(
+            title: "Search Session Logs…",
+            action: #selector(showSessionLogSearch(_:)),
+            keyEquivalent: "")
+        item.target = self
+        item.setImageIfDesired(systemSymbolName: "doc.text.magnifyingglass")
+        appMenu.insertItem(item, at: anchor + 1)
     }
 
     private func setupMenuImages() {

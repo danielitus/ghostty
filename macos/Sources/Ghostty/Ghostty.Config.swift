@@ -135,6 +135,17 @@ extension Ghostty {
             return .init(rawValue: v)
         }
 
+        /// Directory that session logs are written to, if logging is on.
+        var sessionLogDirectory: String? {
+            guard let config = self.config else { return nil }
+            var v = ghostty_config_path_s()
+            let key = "session-log-directory"
+            guard ghostty_config_get(config, &v, key, UInt(key.lengthOfBytes(using: .utf8))) else { return nil }
+            guard let cPath = v.path else { return nil }
+            let path = String(cString: cPath)
+            return path.isEmpty ? nil : path
+        }
+
         var bellAudioPath: ConfigPath? {
             guard let config = self.config else { return nil }
             var v = ghostty_config_path_s()
