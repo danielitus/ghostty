@@ -760,6 +760,10 @@ const fake = struct {
     const google = "AI" ++ "za" ++ "SyA1234567890abcdefghijklmnopqrstuv";
     const jwt = "ey" ++ "JhbGciOiJIUzI1NiJ9." ++ "ey" ++ "JzdWIiOiIxMjM0NTY3ODkwIn0." ++
         "dozjgNryP4J3jVmNHl0w5N_XgL0n3I9PlFUP0THsR8U";
+    // Generic credentials, split along with what makes them recognizable
+    // (the `Authorization: Bearer` header, the connection string).
+    const bearer = "abcDEF123456" ++ "ghiJKL789.xyz";
+    const password = "hunter2" ++ "pass";
 };
 
 fn expectRedacted(input: []const u8, expected: []const u8) !void {
@@ -833,7 +837,7 @@ test "jwt" {
 
 test "bearer token" {
     try expectRedacted(
-        "Authorization: Bearer abcDEF123456ghiJKL789.xyz\r\n",
+        "Author" ++ "ization: " ++ "Bea" ++ "rer " ++ fake.bearer ++ "\r\n",
         "Authorization: Bearer [REDACTED:bearer-token]\r\n",
     );
     try expectUnchanged("the bearer of bad news\n");
@@ -841,7 +845,7 @@ test "bearer token" {
 
 test "url password" {
     try expectRedacted(
-        "postgres://admin:hunter2pass@db.internal:5432/app\n",
+        "post" ++ "gres://" ++ "admin" ++ ":" ++ fake.password ++ "@db.internal:5432/app\n",
         "postgres://admin:[REDACTED:password]@db.internal:5432/app\n",
     );
     try expectUnchanged("https://github.com/ghostty-org/ghostty\n");
