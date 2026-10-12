@@ -103,15 +103,34 @@ enum BroadcastInput {
     /// is a binding there (its own config, an active key table, or the
     /// next key of a pending sequence) is skipped for that peer: typing
     /// into one terminal must never run an action in another.
-    static func broadcastKey(_ event: ghostty_input_key_s, from source: Ghostty.SurfaceView) {
-        for peer in peers(of: source) {
-            guard let surface = peer.surface else { continue }
+    ///
+    /// `recipients` limits delivery to the peers that received the key's
+    /// press (for its repeats and release); otherwise all current peers
+    /// are targeted. Returns the peers the event was delivered to.
+    @discardableResult
+    static func broadcastKey(
+        _ event: ghostty_input_key_s,
+        from source: Ghostty.SurfaceView,
+        to recipients: [Ghostty.SurfaceView]? = nil
+    ) -> [Ghostty.SurfaceView] {
+        var delivered: [Ghostty.SurfaceView] = []
+        for peer in recipients ?? peers(of: source) {
+            guard peer !== source, let surface = peer.surface else { continue }
             if event.action != GHOSTTY_ACTION_RELEASE,
                ghostty_surface_key_is_binding(surface, event, nil) {
                 continue
             }
             _ = ghostty_surface_key(surface, event)
+            delivered.append(peer)
         }
+        return delivered
+    }
+
+    /// A peer that received a broadcast key press, held weakly so a closed
+    /// terminal isn't kept alive by a held key.
+    struct Recipient {
+        weak var view: Ghostty.SurfaceView?
+        init(_ view: Ghostty.SurfaceView) { self.view = view }
     }
 
     /// Send pasted text from `source` to its peers. Each peer applies its own

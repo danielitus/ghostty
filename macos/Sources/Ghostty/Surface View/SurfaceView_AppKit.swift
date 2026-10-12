@@ -122,9 +122,11 @@ extension Ghostty {
         /// forwards it instead of `readClipboard`.
         var broadcastPasteDeferred: Bool = false
 
-        /// Keycodes whose press was broadcast, so their release is too (and
-        /// releases of keybind presses are not).
-        private var broadcastPressedKeys: Set<UInt32> = []
+        /// For each key whose press was broadcast, the peers that received
+        /// it. Repeats and the release go to exactly those peers: not to a
+        /// peer that skipped the press (it's a binding there), and not for
+        /// keybind presses on this surface, which aren't broadcast.
+        private var broadcastPressedKeys: [UInt32: [BroadcastInput.Recipient]] = [:]
 
         /// A clipboard confirmation waiting to be handled by its controller.
         @Published var pendingClipboardConfirmation: ClipboardConfirmationRequest? {
@@ -1550,9 +1552,11 @@ extension Ghostty {
             key_ev.composing = composing
 
             let broadcasting = broadcastInputActive && !BroadcastInput.peers(of: self).isEmpty
-            if !broadcasting && !broadcastPressedKeys.isEmpty {
-                // Broadcasting ended with keys held; their peers' releases are lost.
-                broadcastPressedKeys.removeAll()
+            if !broadcasting, action == GHOSTTY_ACTION_RELEASE,
+               let recipients = broadcastPressedKeys.removeValue(forKey: key_ev.keycode) {
+                // Broadcasting ended while the key was held: the peers that
+                // got its press still get its release.
+                BroadcastInput.broadcastKey(key_ev, from: self, to: recipients.compactMap(\.view))
             }
             let send = { (ev: ghostty_input_key_s) -> Bool in
                 broadcasting
@@ -1583,13 +1587,20 @@ extension Ghostty {
             defer { broadcastPasteArmed = false }
             let handled = ghostty_surface_key(surface, ev)
 
-            if ev.action == GHOSTTY_ACTION_RELEASE {
-                if broadcastPressedKeys.remove(ev.keycode) != nil {
-                    BroadcastInput.broadcastKey(ev, from: self)
+            switch ev.action {
+            case GHOSTTY_ACTION_RELEASE:
+                if let recipients = broadcastPressedKeys.removeValue(forKey: ev.keycode) {
+                    BroadcastInput.broadcastKey(ev, from: self, to: recipients.compactMap(\.view))
                 }
-            } else if !isBinding {
-                broadcastPressedKeys.insert(ev.keycode)
-                BroadcastInput.broadcastKey(ev, from: self)
+            case GHOSTTY_ACTION_REPEAT:
+                if !isBinding, let recipients = broadcastPressedKeys[ev.keycode] {
+                    BroadcastInput.broadcastKey(ev, from: self, to: recipients.compactMap(\.view))
+                }
+            default:
+                if !isBinding {
+                    let delivered = BroadcastInput.broadcastKey(ev, from: self)
+                    broadcastPressedKeys[ev.keycode] = delivered.map(BroadcastInput.Recipient.init)
+                }
             }
 
             return handled
