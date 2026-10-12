@@ -38,19 +38,23 @@ pub fn redact(
 
     while (i < input.len) {
         if (self.pem_lines_left > 0) {
-            // Mask key lines until the END marker. A line containing an
-            // escape sequence is terminal UI (such as the next prompt),
-            // never key material, so it ends the block unmasked.
+            // Mask key lines until the END marker. Lines are judged on
+            // their visible text, so colored key output stays masked. A
+            // line that can't be key material (such as the next prompt)
+            // ends the block unmasked.
             const eol = lineEnd(input, i);
             const line = input[i..eol];
-            if (std.mem.indexOfScalar(u8, line, 0x1b) != null) {
-                self.pem_lines_left = 0;
-                continue;
-            }
-            if (std.mem.indexOf(u8, line, "-----END ") != null) {
-                self.pem_lines_left = 0;
-                i = eol;
-                continue;
+            switch (pemLineKind(line)) {
+                .end => {
+                    self.pem_lines_left = 0;
+                    i = eol;
+                    continue;
+                },
+                .other => {
+                    self.pem_lines_left = 0;
+                    continue;
+                },
+                .key => {},
             }
 
             try out.appendSlice(alloc, input[emitted..i]);
@@ -98,6 +102,62 @@ fn lineEnd(s: []const u8, i: usize) usize {
     return nl + 1;
 }
 
+/// Index just past the escape sequence starting at `s[i]` (an ESC).
+fn skipEscape(s: []const u8, i: usize) usize {
+    var j = i + 1;
+    if (j >= s.len) return s.len;
+    switch (s[j]) {
+        '[' => {
+            j += 1;
+            while (j < s.len and !(s[j] >= 0x40 and s[j] <= 0x7e)) j += 1;
+            return @min(j + 1, s.len);
+        },
+        ']', 'P', '_', '^', 'X' => {
+            j += 1;
+            while (j < s.len) : (j += 1) {
+                if (s[j] == 0x07) return j + 1;
+                if (s[j] == 0x1b and j + 1 < s.len and s[j + 1] == '\\') return j + 2;
+            }
+            return s.len;
+        },
+        else => return j + 1,
+    }
+}
+
+const PemLine = enum { key, end, other };
+
+/// Classify a line inside a PEM block by its visible text: base64 key
+/// data or an RFC 1421 header (`Proc-Type: 4,ENCRYPTED`) is key material,
+/// anything else (such as a shell prompt) is not.
+fn pemLineKind(line: []const u8) PemLine {
+    if (std.mem.indexOf(u8, line, "-----END ") != null) return .end;
+
+    var b64 = true;
+    var header = true; // letters and '-' then ':'
+    var colon = false;
+    var visible: usize = 0;
+    var i: usize = 0;
+    while (i < line.len) {
+        const c = line[i];
+        if (c == 0x1b) {
+            i = skipEscape(line, i);
+            continue;
+        }
+        i += 1;
+        if (c == '\r' or c == '\n') continue;
+        visible += 1;
+        if (!(isAlnum(c) or c == '+' or c == '/' or c == '=')) b64 = false;
+        if (!colon) {
+            if (c == ':') {
+                colon = visible > 1;
+                if (!colon) header = false;
+            } else if (!(std.ascii.isAlphabetic(c) or c == '-')) header = false;
+        }
+    }
+    if (visible == 0 or b64 or (header and colon)) return .key;
+    return .other;
+}
+
 fn matchAt(s: []const u8, i: usize) ?Match {
     return switch (s[i]) {
         'A' => awsKey(s, i) orelse googleKey(s, i),
@@ -142,9 +202,21 @@ fn isBearerChar(c: u8) bool {
     };
 }
 
-/// A token can't start in the middle of a word.
+/// A token can't start in the middle of a word. The end of an escape
+/// sequence is a boundary even though its final byte is a letter, as in
+/// a token printed in color (`ESC[32mghp_…`).
 fn atBoundary(s: []const u8, i: usize) bool {
-    return i == 0 or !isB64Url(s[i - 1]);
+    return i == 0 or !isB64Url(s[i - 1]) or afterCsi(s, i);
+}
+
+/// True if `s[0..i]` ends with a complete CSI sequence (`ESC [ … final`).
+fn afterCsi(s: []const u8, i: usize) bool {
+    if (i < 3) return false;
+    const final = s[i - 1];
+    if (final < 0x40 or final > 0x7e) return false;
+    var j = i - 1;
+    while (j > 0 and s[j - 1] >= 0x20 and s[j - 1] <= 0x3f) j -= 1;
+    return j >= 2 and s[j - 1] == '[' and s[j - 2] == 0x1b;
 }
 
 /// Length of the run of `class` characters starting at `i`.
@@ -318,7 +390,7 @@ fn assignment(s: []const u8, i: usize) ?Match {
     // Find the key name, allowing closing quotes and spaces before the
     // separator as in JSON and YAML.
     var k = i;
-    while (k > 0 and (s[k - 1] == ' ' or s[k - 1] == '"' or s[k - 1] == '\'')) k -= 1;
+    while (k > 0 and (isBlank(s[k - 1]) or s[k - 1] == '"' or s[k - 1] == '\'')) k -= 1;
     const name_end = k;
     while (k > 0 and isNameChar(s[k - 1])) k -= 1;
     const name = s[k..name_end];
@@ -329,14 +401,33 @@ fn assignment(s: []const u8, i: usize) ?Match {
     if (s[i] == '=' and i + 1 < s.len and s[i + 1] == '=') return null;
 
     var j = i + 1;
-    while (j < s.len and s[j] == ' ') j += 1;
-    if (j < s.len and (s[j] == '"' or s[j] == '\'')) j += 1;
+    while (j < s.len and isBlank(s[j])) j += 1;
+
+    // A quoted value is masked whole, spaces and punctuation included,
+    // up to its closing quote or the end of the line.
+    if (j < s.len and (s[j] == '"' or s[j] == '\'')) {
+        const quote = s[j];
+        const start = j + 1;
+        var e = start;
+        while (e < s.len and s[e] != quote and s[e] != '\n' and s[e] != '\r') {
+            if (s[e] == '\\' and e + 1 < s.len and s[e + 1] != '\n') e += 1;
+            e += 1;
+        }
+        e = @min(e, s.len);
+        if (e == start or s[start] == '$') return null;
+        return .{ .start = start, .end = e, .kind = "secret" };
+    }
+
     // A shell variable reference isn't the secret itself.
     if (j < s.len and s[j] == '$') return null;
     const start = j;
     while (j < s.len and isValueChar(s[j])) j += 1;
     if (j - start < 4) return null;
     return .{ .start = start, .end = j, .kind = "secret" };
+}
+
+fn isBlank(c: u8) bool {
+    return c == ' ' or c == '\t';
 }
 
 fn isNameChar(c: u8) bool {
@@ -458,6 +549,52 @@ test "assignments" {
         "AWS_SECRET_ACCESS_KEY = [REDACTED:secret]\n",
     );
     try expectRedacted("curl 'x?token=abcd1234&page=2'\n", "curl 'x?token=[REDACTED:secret]&page=2'\n");
+}
+
+test "quoted and tab-separated assignments" {
+    try expectRedacted(
+        "PASSWORD=\"correct horse battery staple\"\n",
+        "PASSWORD=\"[REDACTED:secret]\"\n",
+    );
+    try expectRedacted(
+        "{\"password\": \"abc,def;ghi\"}\n",
+        "{\"password\": \"[REDACTED:secret]\"}\n",
+    );
+    try expectRedacted("password:\tsecret123\n", "password:\t[REDACTED:secret]\n");
+    try expectRedacted(
+        "token='a \\' b' rest\n",
+        "token='[REDACTED:secret]' rest\n",
+    );
+    // Unterminated: masked to the end of the line, not beyond.
+    try expectRedacted("secret = \"abc def\r\nnext\n", "secret = \"[REDACTED:secret]\r\nnext\n");
+    try expectUnchanged("password: \"\"\n");
+    try expectUnchanged("password = \"$DB_PASS\"\n");
+}
+
+test "tokens in color" {
+    try expectRedacted(
+        "\x1b[32mghp_aBcDeFgHiJkLmNoPqRsTuVwXyZ0123456789\x1b[0m\n",
+        "\x1b[32m[REDACTED:github-token]\x1b[0m\n",
+    );
+    try expectRedacted(
+        "\x1b[1;33mAKIAIOSFODNN7EXAMPLE\x1b[m\n",
+        "\x1b[1;33m[REDACTED:aws-access-key]\x1b[m\n",
+    );
+}
+
+test "colored pem block stays masked" {
+    try expectRedacted(
+        "\x1b[33m-----BEGIN RSA PRIVATE KEY-----\x1b[0m\n" ++
+            "\x1b[33mMIIEowIBAAKCAQEAu1SU1LfVLPHCozMxH2Mo4lgOEePzNm0tRgeLezV6ffAt0gun\x1b[0m\n" ++
+            "Proc-Type: 4,ENCRYPTED\n" ++
+            "\x1b[33m-----END RSA PRIVATE KEY-----\x1b[0m\n" ++
+            "$ \n",
+        "\x1b[33m-----BEGIN RSA PRIVATE KEY-----[REDACTED:private-key]\x1b[0m\n" ++
+            "\n" ++
+            "\n" ++
+            "\x1b[33m-----END RSA PRIVATE KEY-----\x1b[0m\n" ++
+            "$ \n",
+    );
 }
 
 test "assignments that are not secrets" {

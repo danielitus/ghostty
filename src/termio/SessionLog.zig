@@ -97,23 +97,51 @@ pub fn write(self: *SessionLog, bytes: []const u8) void {
 }
 
 /// How much of `pending` can be redacted and logged now: everything up to
-/// the last newline, or, once over `limit` bytes without one, up to the
-/// last whitespace or escape sequence. 0 means wait for more output.
+/// the last newline. Once over `limit` bytes without one, as full-screen
+/// programs produce, cut before the last escape sequence or after the
+/// last carriage return; no secret pattern spans either. Failing that,
+/// cut at whitespace that doesn't separate a secret from what introduces
+/// it (`PASSWORD= value`, `Bearer token`). 0 means wait for more output.
 fn cutPoint(pending: []const u8, limit: usize) usize {
     if (std.mem.lastIndexOfScalar(u8, pending, '\n')) |nl| return nl + 1;
     if (pending.len < limit) return 0;
+
     var i = pending.len;
     while (i > 0) {
         i -= 1;
         switch (pending[i]) {
             // Keep the escape sequence whole for the next write.
             0x1b => if (i > 0) return i,
-            ' ', '\t', '\r' => return i + 1,
+            '\r' => return i + 1,
             else => {},
         }
     }
+
+    i = pending.len;
+    while (i > 0) {
+        i -= 1;
+        if ((pending[i] == ' ' or pending[i] == '\t') and safeSpaceCut(pending[0..i]))
+            return i + 1;
+    }
+
     // One enormous unbroken run: nothing better to do than log it.
     return pending.len;
+}
+
+/// Whether whitespace following `before` can end a chunk: not when it
+/// follows an assignment separator or the word "Bearer", whose value
+/// comes after the whitespace.
+fn safeSpaceCut(before: []const u8) bool {
+    const trimmed = std.mem.trimEnd(u8, before, " \t");
+    if (trimmed.len == 0) return true;
+    switch (trimmed[trimmed.len - 1]) {
+        '=', ':', '"', '\'' => return false,
+        else => {},
+    }
+    const word = "bearer";
+    if (trimmed.len >= word.len and
+        std.ascii.eqlIgnoreCase(trimmed[trimmed.len - word.len ..], word)) return false;
+    return true;
 }
 
 fn logRedacted(self: *SessionLog, bytes: []const u8) void {
@@ -300,10 +328,15 @@ test "cutPoint" {
     // Complete lines are logged, the partial line waits.
     try std.testing.expectEqual(@as(usize, 5), cutPoint("ab\nc\nde", 64));
     try std.testing.expectEqual(@as(usize, 0), cutPoint("$ ", 64));
-    // Over the limit: cut after whitespace, or before an escape.
+    // Over the limit: before an escape, after a carriage return, or at
+    // whitespace.
+    try std.testing.expectEqual(@as(usize, 3), cutPoint("abc\x1b[0mdef ghi", 4));
+    try std.testing.expectEqual(@as(usize, 4), cutPoint("abc\rdef ghi", 4));
     try std.testing.expectEqual(@as(usize, 4), cutPoint("abc def", 4));
-    try std.testing.expectEqual(@as(usize, 3), cutPoint("abc\x1b[0mdef", 4));
     try std.testing.expectEqual(@as(usize, 6), cutPoint("abcdef", 4));
+    // Never between a secret and what introduces it.
+    try std.testing.expectEqual(@as(usize, 2), cutPoint("x PASSWORD= secret123", 8));
+    try std.testing.expectEqual(@as(usize, 6), cutPoint("x abc Bearer abcdef", 8));
 }
 
 test "redacted log holds partial lines until complete" {
