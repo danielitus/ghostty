@@ -104,61 +104,119 @@ pub fn write(self: *SessionLog, bytes: []const u8) void {
 /// more output.
 ///
 /// Everything up to the last newline, or once over `limit`, up to the
-/// last carriage return. Over `hard_limit` with neither, the cut goes
-/// before an escape sequence or after whitespace, but only where no
-/// secret can straddle it: outside quotes, not between a value and the
-/// `KEY=` or `Bearer` introducing it, and not in a run of token
-/// characters (the redactor matches across escape sequences, so
-/// `ghp_ESC[0m…` is one token). With no such point, all of it is logged.
+/// last carriage return. Over `hard_limit` with neither, the last point
+/// no secret can straddle (see `lastSafeCut`). If there is none near the
+/// end, the final `holdback` bytes are kept for the next write: a
+/// prefixed token can't start inside an unbroken run of token
+/// characters, so a split earlier than that can't cut one, and the held
+/// bytes are seen again with what follows.
 fn cutPoint(pending: []const u8, limit: usize, hard_limit: usize) usize {
     if (std.mem.lastIndexOfScalar(u8, pending, '\n')) |nl| return nl + 1;
     if (pending.len < limit) return 0;
     if (std.mem.lastIndexOfScalar(u8, pending, '\r')) |cr| return cr + 1;
     if (pending.len < hard_limit) return 0;
 
-    var i = pending.len;
-    while (i > 1) {
-        i -= 1;
-        const cut = switch (pending[i]) {
-            0x1b => if (isTokenChar(pending[i - 1])) continue else i,
-            ' ', '\t' => i + 1,
-            else => continue,
-        };
-        if (safeCut(pending[0..cut])) return cut;
+    // A safe cut far from the end would leave nearly a full buffer to be
+    // rescanned on every write; hold back a bounded tail instead.
+    const safe = lastSafeCut(pending);
+    if (pending.len <= holdback) return safe orelse pending.len;
+    if (safe) |cut| {
+        if (pending.len - cut <= @max(hard_limit / 2, holdback)) return cut;
     }
-    return pending.len;
+
+    // Prefer a blank in the stretch before the held-back tail, where no
+    // token can be cut and no value parted from its introducer. A cut
+    // inside a quoted value is safe either way: the redactor carries an
+    // open quote into the next write.
+    const fallback = pending.len - holdback;
+    const lower = fallback -| holdback;
+    var j = fallback;
+    while (j > lower and j > 1) {
+        if (pending[j - 1] != ' ' and pending[j - 1] != '\t') {
+            j -= 1;
+            continue;
+        }
+        // Every blank in this run follows the same visible byte.
+        const k = lastNonBlank(pending, j - 1);
+        if (introducerSafe(pending, k)) return j;
+        j = k orelse break;
+    }
+    return fallback;
+}
+
+/// Index of the last byte before `end` that isn't a blank, if any.
+fn lastNonBlank(s: []const u8, end: usize) ?usize {
+    var i = end;
+    while (i > 0) {
+        i -= 1;
+        if (s[i] != ' ' and s[i] != '\t') return i;
+    }
+    return null;
+}
+
+const holdback = 4 * 1024;
+
+/// The last index at which `s` can be split without splitting a secret,
+/// found in one forward pass: before an escape sequence that doesn't
+/// follow a token character (the redactor matches across escapes, so
+/// `ghp_ESC[0m…` is one token), or after whitespace, but never inside a
+/// quoted assignment value or between a value and the `KEY=`, `KEY:` or
+/// `Bearer` introducing it. Quotes follow the redactor's rules: a quote
+/// opens a value only right after `=` or `:`, and a backslash escapes the
+/// next character inside it.
+fn lastSafeCut(s: []const u8) ?usize {
+    var best: ?usize = null;
+    var quote: u8 = 0;
+    // Index of the last visible non-blank byte, for introducer checks.
+    var last: ?usize = null;
+
+    var i: usize = 0;
+    while (i < s.len) {
+        const c = s[i];
+        if (quote != 0) {
+            if (c == '\\') {
+                i += 2;
+                continue;
+            }
+            if (c == quote) quote = 0;
+            last = i;
+            i += 1;
+            continue;
+        }
+
+        switch (c) {
+            0x1b => {
+                if (i > 0 and !isTokenChar(s[i - 1]) and introducerSafe(s, last)) best = i;
+                i = Redact.skipEscape(s, i);
+                continue;
+            },
+            ' ', '\t' => if (introducerSafe(s, last)) {
+                best = i + 1;
+            },
+            '"', '\'' => {
+                if (last) |l| if (s[l] == '=' or s[l] == ':') {
+                    quote = c;
+                };
+                last = i;
+            },
+            else => last = i,
+        }
+        i += 1;
+    }
+    return best;
 }
 
 fn isTokenChar(c: u8) bool {
     return std.ascii.isAlphanumeric(c) or c == '_' or c == '-';
 }
 
-/// Whether a chunk can end with `before`: no quote left open, and not
-/// right after an assignment separator or the word "Bearer", whose value
-/// comes next.
-fn safeCut(before: []const u8) bool {
-    var double = false;
-    var single = false;
-    for (before) |c| switch (c) {
-        '"' => if (!single) {
-            double = !double;
-        },
-        '\'' => if (!double) {
-            single = !single;
-        },
-        else => {},
-    };
-    if (double or single) return false;
-
-    const trimmed = std.mem.trimEnd(u8, before, " \t");
-    if (trimmed.len == 0) return true;
-    switch (trimmed[trimmed.len - 1]) {
-        '=', ':' => return false,
-        else => {},
-    }
+/// Whether a value can't follow: the last visible byte isn't an
+/// assignment separator and doesn't end the word "Bearer".
+fn introducerSafe(s: []const u8, last: ?usize) bool {
+    const l = last orelse return true;
+    if (s[l] == '=' or s[l] == ':') return false;
     const word = "bearer";
-    if (trimmed.len >= word.len and
-        std.ascii.eqlIgnoreCase(trimmed[trimmed.len - word.len ..], word)) return false;
+    if (l + 1 >= word.len and std.ascii.eqlIgnoreCase(s[l + 1 - word.len .. l + 1], word)) return false;
     return true;
 }
 
@@ -359,10 +417,30 @@ test "cutPoint never splits a secret" {
     // Not between a value and its introducer.
     try std.testing.expectEqual(@as(usize, 2), cutPoint("x PASSWORD= secret123", 4, 8));
     try std.testing.expectEqual(@as(usize, 6), cutPoint("x abc Bearer abcdef", 4, 8));
-    // Not inside a quoted value.
+    // Not inside a quoted value, escaped quotes included.
     try std.testing.expectEqual(@as(usize, 2), cutPoint("x PASSWORD=\"correct horse battery staple", 4, 8));
+    try std.testing.expectEqual(@as(usize, 2), cutPoint("x PASSWORD=\"abc\\\" tail", 4, 8));
+    // An apostrophe in prose doesn't open a quote.
+    try std.testing.expectEqual(@as(usize, 11), cutPoint("don't stop now", 4, 8));
     // Not inside a token broken up by an escape sequence.
     try std.testing.expectEqual(@as(usize, 2), cutPoint("x ghp_\x1b[0mabcdef", 4, 8));
+}
+
+test "cutPoint holds back a tail when no point is safe" {
+    const run = "x" ** (3 * holdback);
+    const buf = run ++ ":ghp_aBcDeF";
+    try std.testing.expectEqual(buf.len - holdback, cutPoint(buf, 4, 8));
+}
+
+test "cutPoint is linear in the buffer size" {
+    // An open quote followed by many spaces: every candidate is inside
+    // the quote. A rescan per candidate would take minutes here.
+    const alloc = std.testing.allocator;
+    const buf = try alloc.alloc(u8, 4 * hard_max_pending);
+    defer alloc.free(buf);
+    @memset(buf, ' ');
+    @memcpy(buf[0..3], "x=\"");
+    try std.testing.expectEqual(buf.len - holdback, cutPoint(buf, max_pending, hard_max_pending));
 }
 
 test "redacted log keeps a long line whole up to the hard limit" {
@@ -388,6 +466,37 @@ test "redacted log keeps a long line whole up to the hard limit" {
         filler ++ " PASSWORD=\"[REDACTED:secret]\" :[REDACTED:github-token]\n",
         contents,
     );
+}
+
+test "redacted log never splits a secret at the hard limit" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    const io = std.testing.io;
+    const dir = try tmp.dir.realPathFileAlloc(io, ".", alloc);
+    defer alloc.free(dir);
+
+    const filler = "x" ** hard_max_pending;
+    var s = try SessionLog.init(alloc, dir, true);
+    // A token cut by the read boundary, with no safe point before it.
+    s.write(filler ++ ":ghp_aBcDeFgHiJkLmNo");
+    s.write("PqRsTuVwXyZ0123456789 PASSWORD=\"abc\\\" tail");
+    // A quoted value with an escaped quote, longer than the buffer, so
+    // it has to be cut inside.
+    s.write(filler);
+    s.write(" secret\"\n");
+    s.deinit(alloc);
+
+    var it = tmp.dir.iterate();
+    const entry = (try it.next(io)).?;
+    const contents = try tmp.dir.readFileAlloc(io, entry.name, alloc, .unlimited);
+    defer alloc.free(contents);
+    try std.testing.expect(std.mem.indexOf(u8, contents, "ghp_") == null);
+    try std.testing.expect(std.mem.indexOf(u8, contents, "secret\"") == null);
+    try std.testing.expect(std.mem.indexOf(u8, contents, ":[REDACTED:github-token] PASSWORD=\"[REDACTED:secret]") != null);
+    try std.testing.expect(std.mem.endsWith(u8, contents, "[REDACTED:secret]\"\n"));
+    // Nothing of the value survives: only the filler before it.
+    try std.testing.expect(std.mem.indexOf(u8, contents, "tail") == null);
 }
 
 test "redacted log holds partial lines until complete" {

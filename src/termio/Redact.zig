@@ -33,6 +33,16 @@ pem_lines_left: u32 = 0,
 vis: std.ArrayList(u8) = .empty,
 map: std.ArrayList(u32) = .empty,
 
+/// The input with secrets in control-string payloads masked, when it has
+/// any control strings. Reused across calls.
+pre: std.ArrayList(u8) = .empty,
+
+/// The quote character of a quoted secret value that was still open at
+/// the end of the last input, or 0. SessionLog only splits a line when it
+/// must, and a value longer than its buffer has to be split somewhere, so
+/// the next input continues masking until the closing quote.
+open_quote: u8 = 0,
+
 /// Upper bound on the lines of a PEM block. A 4096-bit RSA key is about
 /// 50 lines; encrypted keys add a few header lines.
 const max_pem_lines = 150;
@@ -40,6 +50,7 @@ const max_pem_lines = 150;
 pub fn deinit(self: *Redact, alloc: Allocator) void {
     self.vis.deinit(alloc);
     self.map.deinit(alloc);
+    self.pre.deinit(alloc);
 }
 
 /// Append `input` to `out` with secrets replaced by `[REDACTED:<kind>]`.
@@ -47,8 +58,17 @@ pub fn redact(
     self: *Redact,
     alloc: Allocator,
     out: *std.ArrayList(u8),
-    raw: []const u8,
+    input: []const u8,
 ) Allocator.Error!void {
+    // Control strings (OSC window titles, OSC 8 hyperlinks, DCS, APC)
+    // aren't visible text but are kept in the log, and can carry secrets
+    // such as a token in a hyperlink's URL. Mask those first.
+    const raw = if (hasControlString(input)) raw: {
+        self.pre.clearRetainingCapacity();
+        try maskControlStrings(alloc, &self.pre, input);
+        break :raw self.pre.items;
+    } else input;
+
     // Strip escape sequences, remembering where each visible byte was.
     self.vis.clearRetainingCapacity();
     self.map.clearRetainingCapacity();
@@ -69,6 +89,19 @@ pub fn redact(
 
     var e: Emitter = .{ .alloc = alloc, .out = out, .raw = raw, .map = map };
     var i: usize = 0;
+
+    // Finish a quoted value continued from the last input.
+    if (self.open_quote != 0) {
+        const end = quotedEnd(vis, 0, self.open_quote);
+        if (end > 0) {
+            try out.appendSlice(alloc, "[REDACTED:secret]");
+            try e.dropTo(e.rawEnd(end));
+        }
+        // Still open only if it ran to the end of this input too.
+        if (end < vis.len) self.open_quote = 0;
+        i = end;
+    }
+
     while (i < vis.len) {
         if (self.pem_lines_left > 0) {
             // Mask key lines until the END marker. A line that can't be
@@ -108,6 +141,7 @@ pub fn redact(
         try out.print(alloc, "[REDACTED:{s}]", .{m.kind});
         try e.dropTo(e.rawEnd(m.end));
         i = m.end;
+        if (m.open_quote != 0) self.open_quote = m.open_quote;
 
         if (m.pem) {
             // Keep the rest of the BEGIN line, then mask what follows.
@@ -119,6 +153,73 @@ pub fn redact(
     }
 
     try e.passTo(raw.len);
+}
+
+fn isControlStringIntroducer(c: u8) bool {
+    return switch (c) {
+        ']', 'P', '_', '^', 'X' => true,
+        else => false,
+    };
+}
+
+fn hasControlString(s: []const u8) bool {
+    var i: usize = 0;
+    while (std.mem.indexOfScalarPos(u8, s, i, 0x1b)) |e| {
+        if (e + 1 < s.len and isControlStringIntroducer(s[e + 1])) return true;
+        i = e + 1;
+    }
+    return false;
+}
+
+/// Copy `s` to `out`, masking secrets inside each control string's
+/// payload. The payload is matched like visible text, without the PEM
+/// block state, and the sequence's introducer and terminator are kept.
+fn maskControlStrings(
+    alloc: Allocator,
+    out: *std.ArrayList(u8),
+    s: []const u8,
+) Allocator.Error!void {
+    var i: usize = 0;
+    while (std.mem.indexOfScalarPos(u8, s, i, 0x1b)) |e| {
+        if (e + 1 >= s.len or !isControlStringIntroducer(s[e + 1])) {
+            try out.appendSlice(alloc, s[i .. e + 1]);
+            i = e + 1;
+            continue;
+        }
+        try out.appendSlice(alloc, s[i .. e + 2]);
+        const payload_start = e + 2;
+        var payload_end = payload_start;
+        while (payload_end < s.len) : (payload_end += 1) {
+            if (s[payload_end] == 0x07) break;
+            if (s[payload_end] == 0x1b and payload_end + 1 < s.len and
+                s[payload_end + 1] == '\\') break;
+        }
+        try maskPlain(alloc, out, s[payload_start..payload_end]);
+        i = payload_end;
+    }
+    try out.appendSlice(alloc, s[i..]);
+}
+
+/// Append `text` to `out` with prefixed tokens, assignments, URL
+/// passwords and bearer tokens masked.
+fn maskPlain(alloc: Allocator, out: *std.ArrayList(u8), text: []const u8) Allocator.Error!void {
+    var emitted: usize = 0;
+    var i: usize = 0;
+    while (i < text.len) {
+        const m = matchAt(text, i) orelse {
+            i += 1;
+            continue;
+        };
+        if (m.pem) {
+            i += 1;
+            continue;
+        }
+        try out.appendSlice(alloc, text[emitted..m.start]);
+        try out.print(alloc, "[REDACTED:{s}]", .{m.kind});
+        emitted = m.end;
+        i = m.end;
+    }
+    try out.appendSlice(alloc, text[emitted..]);
 }
 
 /// Writes the raw input up to a point, either unchanged or masked.
@@ -176,6 +277,8 @@ const Match = struct {
     end: usize,
     kind: []const u8,
     pem: bool = false,
+    /// For a quoted value that runs to the end of the input: its quote.
+    open_quote: u8 = 0,
 };
 
 /// Index just past the newline ending the line that contains `i`, or the
@@ -186,7 +289,7 @@ fn lineEnd(s: []const u8, i: usize) usize {
 }
 
 /// Index just past the escape sequence starting at `s[i]` (an ESC).
-fn skipEscape(s: []const u8, i: usize) usize {
+pub fn skipEscape(s: []const u8, i: usize) usize {
     var j = i + 1;
     if (j >= s.len) return s.len;
     switch (s[j]) {
@@ -479,14 +582,14 @@ fn assignment(s: []const u8, i: usize) ?Match {
     if (j < s.len and (s[j] == '"' or s[j] == '\'')) {
         const quote = s[j];
         const start = j + 1;
-        var e = start;
-        while (e < s.len and s[e] != quote and s[e] != '\n' and s[e] != '\r') {
-            if (s[e] == '\\' and e + 1 < s.len and s[e + 1] != '\n') e += 1;
-            e += 1;
-        }
-        e = @min(e, s.len);
+        const e = quotedEnd(s, start, quote);
         if (e == start or s[start] == '$') return null;
-        return .{ .start = start, .end = e, .kind = "secret" };
+        return .{
+            .start = start,
+            .end = e,
+            .kind = "secret",
+            .open_quote = if (e == s.len) quote else 0,
+        };
     }
 
     // A shell variable reference isn't the secret itself.
@@ -495,6 +598,18 @@ fn assignment(s: []const u8, i: usize) ?Match {
     while (j < s.len and isValueChar(s[j])) j += 1;
     if (j - start < 4) return null;
     return .{ .start = start, .end = j, .kind = "secret" };
+}
+
+/// End of a quoted value starting at `start`: its closing quote (a
+/// backslash escapes the next character), the end of the line, or the
+/// end of `s`.
+fn quotedEnd(s: []const u8, start: usize, quote: u8) usize {
+    var e = start;
+    while (e < s.len and s[e] != quote and s[e] != '\n' and s[e] != '\r') {
+        if (s[e] == '\\' and e + 1 < s.len and s[e + 1] != '\n') e += 1;
+        e += 1;
+    }
+    return @min(e, s.len);
 }
 
 fn isBlank(c: u8) bool {
@@ -670,6 +785,37 @@ test "tokens with escape sequences inside" {
     try expectRedacted(
         "password=\"abc\x1b]0;t\x07def\"\n",
         "password=\"[REDACTED:secret]\x1b]0;t\x07\"\n",
+    );
+}
+
+test "secrets in control strings" {
+    // An OSC 8 hyperlink whose URL carries a token.
+    try expectRedacted(
+        "\x1b]8;;https://example.com/?token=secret123\x1b\\link\x1b]8;;\x1b\\\n",
+        "\x1b]8;;https://example.com/?token=[REDACTED:secret]\x1b\\link\x1b]8;;\x1b\\\n",
+    );
+    // A window title.
+    try expectRedacted(
+        "\x1b]0;deploy ghp_aBcDeFgHiJkLmNoPqRsTuVwXyZ0123456789\x07$ \n",
+        "\x1b]0;deploy [REDACTED:github-token]\x07$ \n",
+    );
+    // Formatting-only sequences are untouched.
+    try expectUnchanged("\x1b]133;A\x07\x1b[1mbold\x1b[0m\n");
+}
+
+test "quoted value continues into the next input" {
+    const alloc = std.testing.allocator;
+    var r: Redact = .{};
+    defer r.deinit(alloc);
+    var out: std.ArrayList(u8) = .empty;
+    defer out.deinit(alloc);
+
+    try r.redact(alloc, &out, "PASSWORD=\"correct horse");
+    try r.redact(alloc, &out, " battery\x1b[0m staple\" after\n");
+    try r.redact(alloc, &out, "plain\n");
+    try std.testing.expectEqualStrings(
+        "PASSWORD=\"[REDACTED:secret][REDACTED:secret]\x1b[0m\" after\nplain\n",
+        out.items,
     );
 }
 
