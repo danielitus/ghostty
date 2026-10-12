@@ -6,6 +6,10 @@ import SwiftUI
 @MainActor
 final class PasswordManagerTarget: ObservableObject {
     @Published var title: String?
+
+    /// The password prompt on the target terminal, if it's at one. The
+    /// panel uses it to suggest the matching entry.
+    @Published var prompt: PasswordPrompt?
 }
 
 /// Floating panel hosting the password manager, similar to iTerm2's.
@@ -97,6 +101,7 @@ class PasswordManagerController: NSWindowController, NSWindowDelegate {
         refreshTarget()
 
         window.makeKeyAndOrderFront(nil)
+        refreshPromptSoon()
 
         // Opening a locked vault with Touch ID enabled goes straight to the
         // biometric prompt, so a password prompt in the terminal becomes:
@@ -116,6 +121,13 @@ class PasswordManagerController: NSWindowController, NSWindowDelegate {
     /// not reopen it for the same prompt. Closes it only when the prompt
     /// that opened it ends.
     func passwordPromptDetected(active: Bool, on surface: Ghostty.SurfaceView) {
+        // An open panel follows prompts appearing and ending, so its
+        // suggestion matches what Send would type into right now.
+        if window?.isVisible ?? false {
+            refreshTarget()
+            refreshPromptSoon()
+        }
+
         guard UserDefaults.standard.bool(forKey: "PasswordManagerAutoOpen") else { return }
 
         if active {
@@ -191,10 +203,28 @@ class PasswordManagerController: NSWindowController, NSWindowDelegate {
     private func refreshTarget() {
         guard let surface = Self.currentFocusedSurface() else {
             target.title = nil
+            target.prompt = nil
             return
         }
         let windowTitle = surface.window?.title ?? ""
         target.title = windowTitle.isEmpty ? surface.title : windowTitle
+
+        let prompt = surface.passwordInput
+            ? PasswordPrompt.parse(screen: surface.activeScreenText())
+            : nil
+        if target.prompt != prompt { target.prompt = prompt }
+    }
+
+    /// Programs switch the terminal to password mode before printing the
+    /// prompt, so the prompt text may not be on screen yet when that's
+    /// detected. If it wasn't recognized, read the screen again shortly.
+    private func refreshPromptSoon() {
+        guard target.prompt == nil || target.prompt?.kind == .generic,
+              Self.currentFocusedSurface()?.passwordInput == true else { return }
+        DispatchQueue.main.asyncAfter(deadline: .now() + .milliseconds(250)) { [weak self] in
+            guard let self, self.window?.isVisible ?? false else { return }
+            self.refreshTarget()
+        }
     }
 
     // MARK: - NSWindowDelegate

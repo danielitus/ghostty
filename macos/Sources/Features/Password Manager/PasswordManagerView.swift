@@ -204,6 +204,11 @@ private struct PasswordListView: View {
         filtered.first { $0.id == selection }
     }
 
+    /// The entry the terminal's password prompt most likely wants.
+    private var suggestion: PasswordEntry? {
+        target.prompt?.bestMatch(in: vault.entries)
+    }
+
     var body: some View {
         VStack(spacing: 0) {
             HStack(spacing: 6) {
@@ -224,6 +229,12 @@ private struct PasswordListView: View {
             .padding(6)
             .background(.quaternary.opacity(0.5), in: RoundedRectangle(cornerRadius: 6))
             .padding(10)
+
+            if let prompt = target.prompt {
+                PasswordPromptHint(prompt: prompt, suggestion: suggestion)
+                    .padding(.horizontal, 10)
+                    .padding(.bottom, 8)
+            }
 
             if filtered.isEmpty {
                 VStack(spacing: 8) {
@@ -255,6 +266,14 @@ private struct PasswordListView: View {
                                         .font(.caption)
                                         .foregroundStyle(.secondary)
                                 }
+                            }
+                            if entry.id == suggestion?.id {
+                                Spacer()
+                                Text("Suggested")
+                                    .font(.caption2.weight(.medium))
+                                    .padding(.horizontal, 6)
+                                    .padding(.vertical, 1)
+                                    .background(.tint.opacity(0.2), in: Capsule())
                             }
                         }
                         .padding(.vertical, 2)
@@ -401,7 +420,11 @@ private struct PasswordListView: View {
             }
         }
         .frame(width: 340, height: 440)
-        .onAppear { selectFirstIfNeeded() }
+        .onAppear {
+            applySuggestion()
+            selectFirstIfNeeded()
+        }
+        .onChange(of: suggestion?.id) { _ in applySuggestion() }
         .onChange(of: search) { _ in selectFirstIfNeeded() }
         // Keep a valid selection across adds, deletes, and reorders too,
         // not just searches: the first entry added to an empty vault is
@@ -434,6 +457,13 @@ private struct PasswordListView: View {
         if selected == nil { selection = filtered.first?.id }
     }
 
+    /// Select the suggested entry so Return sends it, unless the user is
+    /// searching for something else.
+    private func applySuggestion() {
+        guard search.isEmpty, let suggestion else { return }
+        selection = suggestion.id
+    }
+
     /// Run a vault mutation and surface its failure instead of hiding it;
     /// the vault only publishes changes that were written, so a failure
     /// here means nothing changed.
@@ -464,6 +494,41 @@ private struct PasswordListView: View {
         })
         guard !clean.isEmpty else { return }
         onSend(clean, pressEnter)
+    }
+}
+
+// MARK: - Prompt hint
+
+/// Shows the password prompt the terminal is at and the entry suggested
+/// for it, so it's clear why an entry is preselected.
+private struct PasswordPromptHint: View {
+    let prompt: PasswordPrompt
+    let suggestion: PasswordEntry?
+
+    var body: some View {
+        HStack(alignment: .top, spacing: 8) {
+            Image(systemName: suggestion == nil ? "key" : "key.fill")
+                .foregroundStyle(.secondary)
+            VStack(alignment: .leading, spacing: 2) {
+                Text(prompt.summary)
+                    .font(.caption.weight(.medium))
+                    .lineLimit(1)
+                    .truncationMode(.middle)
+                if let suggestion {
+                    Text("Suggested: \(suggestion.label)")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                } else {
+                    Text("No saved entry clearly matches this prompt.")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                }
+            }
+            Spacer(minLength: 0)
+        }
+        .padding(8)
+        .background(.quaternary.opacity(0.35), in: RoundedRectangle(cornerRadius: 6))
+        .help(prompt.line)
     }
 }
 

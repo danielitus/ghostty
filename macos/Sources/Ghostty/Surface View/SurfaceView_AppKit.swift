@@ -177,6 +177,29 @@ extension Ghostty {
         // reopen it for the same prompt.
         var passwordManagerOffered = false
 
+        /// The text of the active area (the bottom screenful, where the
+        /// cursor is), read now. Used to parse a password prompt; the
+        /// cached screen contents can be up to 500 ms old and predate it.
+        func activeScreenText() -> String {
+            guard let surface = self.surface else { return "" }
+            var text = ghostty_text_s()
+            let sel = ghostty_selection_s(
+                top_left: ghostty_point_s(
+                    tag: GHOSTTY_POINT_ACTIVE,
+                    coord: GHOSTTY_POINT_COORD_TOP_LEFT,
+                    x: 0,
+                    y: 0),
+                bottom_right: ghostty_point_s(
+                    tag: GHOSTTY_POINT_ACTIVE,
+                    coord: GHOSTTY_POINT_COORD_BOTTOM_RIGHT,
+                    x: 0,
+                    y: 0),
+                rectangle: false)
+            guard ghostty_surface_read_text(surface, sel, &text) else { return "" }
+            defer { ghostty_surface_free_text(surface, &text) }
+            return String(cString: text.text)
+        }
+
         // Returns true if quit confirmation is required for this surface to
         // exit safely.
         var needsConfirmQuit: Bool {
