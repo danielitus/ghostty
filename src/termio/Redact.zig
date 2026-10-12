@@ -9,6 +9,12 @@
 //! blobs are everywhere in a developer's terminal and masking them would
 //! make the logs useless.
 //!
+//! Patterns are matched against the visible text, with escape sequences
+//! removed, and the matching raw bytes are masked. A token printed with
+//! color codes around or inside it (`ESC[31mghp_ESC[0m…`) is therefore
+//! still recognized; the escape sequences inside a masked span are kept
+//! after the replacement so the terminal state the log replays is intact.
+//!
 //! The redactor is fed complete lines (see SessionLog), so a secret is
 //! never split across calls. The only state carried between calls is
 //! whether a PEM private key block is open.
@@ -22,29 +28,54 @@ const Allocator = std.mem.Allocator;
 /// grep) can't mask the rest of the session.
 pem_lines_left: u32 = 0,
 
+/// Visible text of the current input and, for each visible byte, its
+/// index in the raw input. Reused across calls.
+vis: std.ArrayList(u8) = .empty,
+map: std.ArrayList(u32) = .empty,
+
 /// Upper bound on the lines of a PEM block. A 4096-bit RSA key is about
 /// 50 lines; encrypted keys add a few header lines.
 const max_pem_lines = 150;
+
+pub fn deinit(self: *Redact, alloc: Allocator) void {
+    self.vis.deinit(alloc);
+    self.map.deinit(alloc);
+}
 
 /// Append `input` to `out` with secrets replaced by `[REDACTED:<kind>]`.
 pub fn redact(
     self: *Redact,
     alloc: Allocator,
     out: *std.ArrayList(u8),
-    input: []const u8,
+    raw: []const u8,
 ) Allocator.Error!void {
-    var emitted: usize = 0;
-    var i: usize = 0;
+    // Strip escape sequences, remembering where each visible byte was.
+    self.vis.clearRetainingCapacity();
+    self.map.clearRetainingCapacity();
+    {
+        var r: usize = 0;
+        while (r < raw.len) {
+            if (raw[r] == 0x1b) {
+                r = skipEscape(raw, r);
+                continue;
+            }
+            try self.vis.append(alloc, raw[r]);
+            try self.map.append(alloc, @intCast(r));
+            r += 1;
+        }
+    }
+    const vis = self.vis.items;
+    const map = self.map.items;
 
-    while (i < input.len) {
+    var e: Emitter = .{ .alloc = alloc, .out = out, .raw = raw, .map = map };
+    var i: usize = 0;
+    while (i < vis.len) {
         if (self.pem_lines_left > 0) {
-            // Mask key lines until the END marker. Lines are judged on
-            // their visible text, so colored key output stays masked. A
-            // line that can't be key material (such as the next prompt)
-            // ends the block unmasked.
-            const eol = lineEnd(input, i);
-            const line = input[i..eol];
-            switch (pemLineKind(line)) {
+            // Mask key lines until the END marker. A line that can't be
+            // key material (such as the next prompt) ends the block
+            // unmasked.
+            const eol = lineEnd(vis, i);
+            switch (pemLineKind(vis[i..eol])) {
                 .end => {
                     self.pem_lines_left = 0;
                     i = eol;
@@ -57,36 +88,88 @@ pub fn redact(
                 .key => {},
             }
 
-            try out.appendSlice(alloc, input[emitted..i]);
-            for (line) |c| if (c == '\r' or c == '\n') try out.append(alloc, c);
-            emitted = eol;
+            // Keep only the line's escape sequences and line breaks.
+            try e.passTo(e.rawIndex(i));
+            try e.dropTo(e.rawEnd(eol));
             i = eol;
             self.pem_lines_left -= 1;
             continue;
         }
 
-        const m = matchAt(input, i) orelse {
+        const m = matchAt(vis, i) orelse {
             i += 1;
             continue;
         };
 
-        try out.appendSlice(alloc, input[emitted..m.start]);
+        // Escape sequences just before the secret (its color) stay in
+        // front of the replacement. A zero-width match marks a position
+        // right after visible text, before any escapes that follow it.
+        try e.passTo(if (m.start == m.end) e.rawEnd(m.start) else e.rawIndex(m.start));
         try out.print(alloc, "[REDACTED:{s}]", .{m.kind});
-        emitted = m.end;
+        try e.dropTo(e.rawEnd(m.end));
         i = m.end;
 
         if (m.pem) {
             // Keep the rest of the BEGIN line, then mask what follows.
-            const eol = lineEnd(input, i);
-            try out.appendSlice(alloc, input[i..eol]);
-            emitted = eol;
+            const eol = lineEnd(vis, i);
+            try e.passTo(e.rawEnd(eol));
             i = eol;
             self.pem_lines_left = max_pem_lines;
         }
     }
 
-    try out.appendSlice(alloc, input[emitted..]);
+    try e.passTo(raw.len);
 }
+
+/// Writes the raw input up to a point, either unchanged or masked.
+const Emitter = struct {
+    alloc: Allocator,
+    out: *std.ArrayList(u8),
+    raw: []const u8,
+    map: []const u32,
+    /// Raw bytes before this index have been handled.
+    done: usize = 0,
+
+    /// Raw index of the visible byte at `v`.
+    fn rawIndex(self: *const Emitter, v: usize) usize {
+        return if (v < self.map.len) self.map[v] else self.raw.len;
+    }
+
+    /// Raw index just past the visible byte before `v`: the end of the
+    /// raw span for visible text ending at `v`. Escape sequences after
+    /// that byte belong to what follows.
+    fn rawEnd(self: *const Emitter, v: usize) usize {
+        if (v >= self.map.len) return self.raw.len;
+        return if (v == 0) 0 else self.map[v - 1] + 1;
+    }
+
+    /// Copy raw bytes unchanged up to `end`.
+    fn passTo(self: *Emitter, end: usize) Allocator.Error!void {
+        if (end <= self.done) return;
+        try self.out.appendSlice(self.alloc, self.raw[self.done..end]);
+        self.done = end;
+    }
+
+    /// Mask raw bytes up to `end`, keeping their escape sequences and
+    /// line breaks.
+    fn dropTo(self: *Emitter, end: usize) Allocator.Error!void {
+        var r = self.done;
+        while (r < end) {
+            switch (self.raw[r]) {
+                0x1b => {
+                    const next = @min(skipEscape(self.raw, r), end);
+                    try self.out.appendSlice(self.alloc, self.raw[r..next]);
+                    r = next;
+                    continue;
+                },
+                '\r', '\n' => try self.out.append(self.alloc, self.raw[r]),
+                else => {},
+            }
+            r += 1;
+        }
+        self.done = @max(self.done, end);
+    }
+};
 
 const Match = struct {
     start: usize,
@@ -202,21 +285,9 @@ fn isBearerChar(c: u8) bool {
     };
 }
 
-/// A token can't start in the middle of a word. The end of an escape
-/// sequence is a boundary even though its final byte is a letter, as in
-/// a token printed in color (`ESC[32mghp_…`).
+/// A token can't start in the middle of a word.
 fn atBoundary(s: []const u8, i: usize) bool {
-    return i == 0 or !isB64Url(s[i - 1]) or afterCsi(s, i);
-}
-
-/// True if `s[0..i]` ends with a complete CSI sequence (`ESC [ … final`).
-fn afterCsi(s: []const u8, i: usize) bool {
-    if (i < 3) return false;
-    const final = s[i - 1];
-    if (final < 0x40 or final > 0x7e) return false;
-    var j = i - 1;
-    while (j > 0 and s[j - 1] >= 0x20 and s[j - 1] <= 0x3f) j -= 1;
-    return j >= 2 and s[j - 1] == '[' and s[j - 2] == 0x1b;
+    return i == 0 or !isB64Url(s[i - 1]);
 }
 
 /// Length of the run of `class` characters starting at `i`.
@@ -455,6 +526,7 @@ fn endsWithSecretKey(name: []const u8) bool {
 fn expectRedacted(input: []const u8, expected: []const u8) !void {
     const alloc = std.testing.allocator;
     var r: Redact = .{};
+    defer r.deinit(alloc);
     var out: std.ArrayList(u8) = .empty;
     defer out.deinit(alloc);
     try r.redact(alloc, &out, input);
@@ -582,6 +654,25 @@ test "tokens in color" {
     );
 }
 
+test "tokens with escape sequences inside" {
+    // Only the prefix highlighted: the reset inside the token is kept
+    // after the replacement.
+    try expectRedacted(
+        "\x1b[31mghp_\x1b[0maBcDeFgHiJkLmNoPqRsTuVwXyZ0123456789 ok\n",
+        "\x1b[31m[REDACTED:github-token]\x1b[0m ok\n",
+    );
+    // Formatting in the middle of the body.
+    try expectRedacted(
+        "AKIAIOSF\x1b[1mODNN7EXAMPLE\x1b[22m\n",
+        "[REDACTED:aws-access-key]\x1b[1m\x1b[22m\n",
+    );
+    // An OSC sequence inside a quoted value.
+    try expectRedacted(
+        "password=\"abc\x1b]0;t\x07def\"\n",
+        "password=\"[REDACTED:secret]\x1b]0;t\x07\"\n",
+    );
+}
+
 test "colored pem block stays masked" {
     try expectRedacted(
         "\x1b[33m-----BEGIN RSA PRIVATE KEY-----\x1b[0m\n" ++
@@ -590,7 +681,7 @@ test "colored pem block stays masked" {
             "\x1b[33m-----END RSA PRIVATE KEY-----\x1b[0m\n" ++
             "$ \n",
         "\x1b[33m-----BEGIN RSA PRIVATE KEY-----[REDACTED:private-key]\x1b[0m\n" ++
-            "\n" ++
+            "\x1b[33m\x1b[0m\n" ++
             "\n" ++
             "\x1b[33m-----END RSA PRIVATE KEY-----\x1b[0m\n" ++
             "$ \n",
@@ -637,6 +728,7 @@ test "pem private key block" {
 test "pem block spans calls and ends at terminal UI" {
     const alloc = std.testing.allocator;
     var r: Redact = .{};
+    defer r.deinit(alloc);
     var out: std.ArrayList(u8) = .empty;
     defer out.deinit(alloc);
 
@@ -658,6 +750,7 @@ test "pem block spans calls and ends at terminal UI" {
 test "pem block is bounded" {
     const alloc = std.testing.allocator;
     var r: Redact = .{};
+    defer r.deinit(alloc);
     var out: std.ArrayList(u8) = .empty;
     defer out.deinit(alloc);
 

@@ -42,10 +42,13 @@ scratch: std.ArrayList(u8) = .empty,
 
 alloc: ?Allocator = null,
 
-/// Above this much pending output without a newline, as full-screen
-/// programs produce, the pending output is logged up to its last
-/// whitespace or escape sequence, which no secret pattern spans.
+/// Output without a newline is held back so that a secret on a long line
+/// is seen whole. Past `max_pending` it is logged up to its last carriage
+/// return, which no secret spans. Past `hard_max_pending`, as full-screen
+/// programs that only position the cursor produce, it is split at the
+/// last point provably outside a secret (see `cutPoint`).
 const max_pending = 16 * 1024;
+const hard_max_pending = 256 * 1024;
 
 pub fn init(
     alloc: Allocator,
@@ -65,6 +68,7 @@ pub fn deinit(self: *SessionLog, alloc: Allocator) void {
     self.flush();
     if (self.file) |f| f.close(global.io());
     if (self.dir) |d| alloc.free(d);
+    if (self.redact) |*r| r.deinit(alloc);
     self.pending.deinit(alloc);
     self.scratch.deinit(alloc);
     self.* = .{};
@@ -86,7 +90,7 @@ pub fn write(self: *SessionLog, bytes: []const u8) void {
     const alloc = self.alloc.?;
     self.pending.appendSlice(alloc, bytes) catch return self.fail(error.OutOfMemory);
 
-    const cut = cutPoint(self.pending.items, max_pending);
+    const cut = cutPoint(self.pending.items, max_pending, hard_max_pending);
     if (cut == 0) return;
     self.logRedacted(self.pending.items[0..cut]);
 
@@ -96,46 +100,60 @@ pub fn write(self: *SessionLog, bytes: []const u8) void {
     self.pending.shrinkRetainingCapacity(rest);
 }
 
-/// How much of `pending` can be redacted and logged now: everything up to
-/// the last newline. Once over `limit` bytes without one, as full-screen
-/// programs produce, cut before the last escape sequence or after the
-/// last carriage return; no secret pattern spans either. Failing that,
-/// cut at whitespace that doesn't separate a secret from what introduces
-/// it (`PASSWORD= value`, `Bearer token`). 0 means wait for more output.
-fn cutPoint(pending: []const u8, limit: usize) usize {
+/// How much of `pending` can be redacted and logged now. 0 means wait for
+/// more output.
+///
+/// Everything up to the last newline, or once over `limit`, up to the
+/// last carriage return. Over `hard_limit` with neither, the cut goes
+/// before an escape sequence or after whitespace, but only where no
+/// secret can straddle it: outside quotes, not between a value and the
+/// `KEY=` or `Bearer` introducing it, and not in a run of token
+/// characters (the redactor matches across escape sequences, so
+/// `ghp_ESC[0m…` is one token). With no such point, all of it is logged.
+fn cutPoint(pending: []const u8, limit: usize, hard_limit: usize) usize {
     if (std.mem.lastIndexOfScalar(u8, pending, '\n')) |nl| return nl + 1;
     if (pending.len < limit) return 0;
+    if (std.mem.lastIndexOfScalar(u8, pending, '\r')) |cr| return cr + 1;
+    if (pending.len < hard_limit) return 0;
 
     var i = pending.len;
-    while (i > 0) {
+    while (i > 1) {
         i -= 1;
-        switch (pending[i]) {
-            // Keep the escape sequence whole for the next write.
-            0x1b => if (i > 0) return i,
-            '\r' => return i + 1,
-            else => {},
-        }
+        const cut = switch (pending[i]) {
+            0x1b => if (isTokenChar(pending[i - 1])) continue else i,
+            ' ', '\t' => i + 1,
+            else => continue,
+        };
+        if (safeCut(pending[0..cut])) return cut;
     }
-
-    i = pending.len;
-    while (i > 0) {
-        i -= 1;
-        if ((pending[i] == ' ' or pending[i] == '\t') and safeSpaceCut(pending[0..i]))
-            return i + 1;
-    }
-
-    // One enormous unbroken run: nothing better to do than log it.
     return pending.len;
 }
 
-/// Whether whitespace following `before` can end a chunk: not when it
-/// follows an assignment separator or the word "Bearer", whose value
-/// comes after the whitespace.
-fn safeSpaceCut(before: []const u8) bool {
+fn isTokenChar(c: u8) bool {
+    return std.ascii.isAlphanumeric(c) or c == '_' or c == '-';
+}
+
+/// Whether a chunk can end with `before`: no quote left open, and not
+/// right after an assignment separator or the word "Bearer", whose value
+/// comes next.
+fn safeCut(before: []const u8) bool {
+    var double = false;
+    var single = false;
+    for (before) |c| switch (c) {
+        '"' => if (!single) {
+            double = !double;
+        },
+        '\'' => if (!double) {
+            single = !single;
+        },
+        else => {},
+    };
+    if (double or single) return false;
+
     const trimmed = std.mem.trimEnd(u8, before, " \t");
     if (trimmed.len == 0) return true;
     switch (trimmed[trimmed.len - 1]) {
-        '=', ':', '"', '\'' => return false,
+        '=', ':' => return false,
         else => {},
     }
     const word = "bearer";
@@ -326,17 +344,50 @@ test "disabled log ignores writes" {
 
 test "cutPoint" {
     // Complete lines are logged, the partial line waits.
-    try std.testing.expectEqual(@as(usize, 5), cutPoint("ab\nc\nde", 64));
-    try std.testing.expectEqual(@as(usize, 0), cutPoint("$ ", 64));
-    // Over the limit: before an escape, after a carriage return, or at
-    // whitespace.
-    try std.testing.expectEqual(@as(usize, 3), cutPoint("abc\x1b[0mdef ghi", 4));
-    try std.testing.expectEqual(@as(usize, 4), cutPoint("abc\rdef ghi", 4));
-    try std.testing.expectEqual(@as(usize, 4), cutPoint("abc def", 4));
-    try std.testing.expectEqual(@as(usize, 6), cutPoint("abcdef", 4));
-    // Never between a secret and what introduces it.
-    try std.testing.expectEqual(@as(usize, 2), cutPoint("x PASSWORD= secret123", 8));
-    try std.testing.expectEqual(@as(usize, 6), cutPoint("x abc Bearer abcdef", 8));
+    try std.testing.expectEqual(@as(usize, 5), cutPoint("ab\nc\nde", 4, 8));
+    try std.testing.expectEqual(@as(usize, 0), cutPoint("$ ", 4, 8));
+    // Over the soft limit: after a carriage return, else keep waiting.
+    try std.testing.expectEqual(@as(usize, 4), cutPoint("abc\rdef ghi", 4, 64));
+    try std.testing.expectEqual(@as(usize, 0), cutPoint("abc def ghi", 4, 64));
+    // Over the hard limit: whitespace or before an escape.
+    try std.testing.expectEqual(@as(usize, 8), cutPoint("abc def ghi", 4, 8));
+    try std.testing.expectEqual(@as(usize, 4), cutPoint("abc \x1b[0mdefghi", 4, 8));
+    try std.testing.expectEqual(@as(usize, 6), cutPoint("abcdef", 4, 4));
+}
+
+test "cutPoint never splits a secret" {
+    // Not between a value and its introducer.
+    try std.testing.expectEqual(@as(usize, 2), cutPoint("x PASSWORD= secret123", 4, 8));
+    try std.testing.expectEqual(@as(usize, 6), cutPoint("x abc Bearer abcdef", 4, 8));
+    // Not inside a quoted value.
+    try std.testing.expectEqual(@as(usize, 2), cutPoint("x PASSWORD=\"correct horse battery staple", 4, 8));
+    // Not inside a token broken up by an escape sequence.
+    try std.testing.expectEqual(@as(usize, 2), cutPoint("x ghp_\x1b[0mabcdef", 4, 8));
+}
+
+test "redacted log keeps a long line whole up to the hard limit" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    const io = std.testing.io;
+    const dir = try tmp.dir.realPathFileAlloc(io, ".", alloc);
+    defer alloc.free(dir);
+
+    const filler = "x" ** (max_pending + 10);
+    var s = try SessionLog.init(alloc, dir, true);
+    s.write(filler ++ " PASSWORD=\"correct horse ");
+    s.write("battery staple\" :ghp_aBcDeFgHiJkLmNo");
+    s.write("PqRsTuVwXyZ0123456789\n");
+    s.deinit(alloc);
+
+    var it = tmp.dir.iterate();
+    const entry = (try it.next(io)).?;
+    const contents = try tmp.dir.readFileAlloc(io, entry.name, alloc, .unlimited);
+    defer alloc.free(contents);
+    try std.testing.expectEqualStrings(
+        filler ++ " PASSWORD=\"[REDACTED:secret]\" :[REDACTED:github-token]\n",
+        contents,
+    );
 }
 
 test "redacted log holds partial lines until complete" {
