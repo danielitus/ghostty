@@ -658,6 +658,14 @@ extension Ghostty {
             return AutoUpdateChannel(rawValue: str) ?? defaultValue
         }
 
+        var clipboardPasteProtection: Bool {
+            guard let config = self.config else { return true }
+            var v = true
+            let key = "clipboard-paste-protection"
+            _ = ghostty_config_get(config, &v, key, UInt(key.lengthOfBytes(using: .utf8)))
+            return v
+        }
+
         var autoSecureInput: Bool {
             guard let config = self.config else { return true }
             var v = false

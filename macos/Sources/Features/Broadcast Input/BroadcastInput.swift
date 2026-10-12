@@ -98,20 +98,68 @@ enum BroadcastInput {
     /// Send a key event typed into `source` to its peers. The caller must
     /// already have checked that the event is not a keybind on `source`.
     /// `event.text` only needs to be valid for the duration of this call.
+    ///
+    /// A peer delivers the key through its own key handling, so a key that
+    /// is a binding there (its own config, an active key table, or the
+    /// next key of a pending sequence) is skipped for that peer: typing
+    /// into one terminal must never run an action in another.
     static func broadcastKey(_ event: ghostty_input_key_s, from source: Ghostty.SurfaceView) {
         for peer in peers(of: source) {
             guard let surface = peer.surface else { continue }
+            if event.action != GHOSTTY_ACTION_RELEASE,
+               ghostty_surface_key_is_binding(surface, event, nil) {
+                continue
+            }
             _ = ghostty_surface_key(surface, event)
         }
     }
 
     /// Send pasted text from `source` to its peers. Each peer applies its own
     /// bracketed paste mode.
+    ///
+    /// Text sent to a peer bypasses that peer's paste protection, and a
+    /// peer at a shell without bracketed paste runs each line as it
+    /// arrives, whatever the source terminal accepted. So a paste that
+    /// paste protection would flag (several lines, or a bracketed paste
+    /// terminator) is only broadcast after the user confirms it for the
+    /// other terminals.
     static func broadcastPaste(_ text: String, from source: Ghostty.SurfaceView) {
         guard !text.isEmpty else { return }
+        let count = peers(of: source).count
+        guard count > 0 else { return }
+
+        let protect = (NSApp.delegate as? AppDelegate)?.ghostty.config.clipboardPasteProtection ?? true
+        guard protect, isUnsafePaste(text), let window = source.window else {
+            send(text, from: source)
+            return
+        }
+
+        let lines = text.split(omittingEmptySubsequences: false, whereSeparator: \.isNewline).count
+        let alert = NSAlert()
+        alert.messageText = "Paste into \(count) other \(count == 1 ? "terminal" : "terminals")?"
+        alert.informativeText = "This paste has \(lines) lines. Broadcast input sends it to "
+            + "every terminal it targets, where a shell without bracketed paste "
+            + "runs each line as a command."
+        alert.addButton(withTitle: "Paste in All")
+        alert.addButton(withTitle: "Only This Terminal")
+        alert.alertStyle = .warning
+        alert.beginSheetModal(for: window) { [weak source] response in
+            guard response == .alertFirstButtonReturn, let source else { return }
+            MainActor.assumeIsolated { send(text, from: source) }
+        }
+    }
+
+    private static func send(_ text: String, from source: Ghostty.SurfaceView) {
         for peer in peers(of: source) {
             peer.surfaceModel?.sendText(text)
         }
+    }
+
+    /// Mirrors the core's paste safety check: newlines can execute
+    /// commands, and a bracketed paste end sequence can break out of
+    /// bracketed paste.
+    static func isUnsafePaste(_ text: String) -> Bool {
+        text.contains(where: \.isNewline) || text.contains("\u{1b}[201~")
     }
 
     // MARK: Helpers
