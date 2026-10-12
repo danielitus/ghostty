@@ -69,6 +69,26 @@ struct SessionLogSearchTests {
         #expect(results[1].hits.first?.text == "fatal: Disk full")
     }
 
+    /// A newline-free stream is searched in segments; a match straddling a
+    /// segment boundary is still found, on the right line.
+    @Test func longLineMatchAcrossSegments() async throws {
+        let dir = FileManager.default.temporaryDirectory
+            .appendingPathComponent("ghostty-log-search-\(UUID().uuidString)")
+        try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: dir) }
+
+        let filler = String(repeating: "x", count: SessionLogSearch.maxSegment - 3)
+        let tail = String(repeating: "y", count: 200_000)
+        let file = dir.appendingPathComponent("20261011_090000.ghostty.1.a.log")
+        try ("first\n" + filler + "NEEDLE" + tail + "\nlast\n").write(to: file, atomically: true, encoding: .utf8)
+
+        let results = await SessionLogSearch.search("needle", in: dir)
+        #expect(results.first?.hits.map(\.line) == [2])
+        #expect(results.first?.hits.first?.text.contains("NEEDLE") == true)
+        // The excerpt stays bounded.
+        #expect((results.first?.hits.first?.text.count ?? 0) <= SessionLogSearch.maxLineLength + 2)
+    }
+
     @Test func shellQuote() {
         #expect(SessionLogSearchController.shellQuote("/a b/it's.log") == "'/a b/it'\\''s.log'")
     }

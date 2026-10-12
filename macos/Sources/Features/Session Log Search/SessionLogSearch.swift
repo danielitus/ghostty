@@ -33,6 +33,14 @@ enum SessionLogSearch {
     /// Display width kept around a match in very long lines.
     static let maxLineLength = 400
 
+    /// Very long lines are searched this many raw bytes at a time, so
+    /// memory stays bounded and cancellation is prompt.
+    static let maxSegment = 64 * 1024
+
+    /// Overlap between segments: longer than any query plus the escape
+    /// sequences that might sit inside a match.
+    static let overlap = 4 * 1024
+
     /// The log files in `directory`, newest first.
     static func logFiles(in directory: URL) -> [URL] {
         let keys: [URLResourceKey] = [.contentModificationDateKey, .isRegularFileKey]
@@ -86,13 +94,26 @@ enum SessionLogSearch {
 
                 if lineNumber % 4096 == 0 && Task.isCancelled { return }
 
-                strip(bytes, from: start, to: end, into: &stripped)
-                if let at = indexOf(needle, in: stripped) {
-                    hits.append(.init(
-                        file: file,
-                        line: lineNumber,
-                        text: display(stripped, matchAt: at, matchLength: needle.count)))
-                    if hits.count >= limit { return }
+                // Full-screen programs can write megabytes without a
+                // newline. Search such a line in bounded segments, which
+                // overlap so a match across a boundary is still found,
+                // checking for cancellation between them. An escape
+                // sequence cut by a boundary may show a few stray bytes.
+                var segment = start
+                while segment < end || segment == start {
+                    let segmentEnd = min(end, segment + maxSegment)
+                    strip(bytes, from: segment, to: segmentEnd, into: &stripped)
+                    if let at = indexOf(needle, in: stripped) {
+                        hits.append(.init(
+                            file: file,
+                            line: lineNumber,
+                            text: display(stripped, matchAt: at, matchLength: needle.count)))
+                        if hits.count >= limit { return }
+                        break
+                    }
+                    if segmentEnd >= end { break }
+                    if Task.isCancelled { return }
+                    segment = segmentEnd - min(segmentEnd - segment, overlap)
                 }
 
                 if end >= bytes.count { break }
