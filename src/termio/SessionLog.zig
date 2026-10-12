@@ -162,11 +162,11 @@ fn cutPoint(pending: []const u8, limit: usize, hard_limit: usize) Cut {
         }
         e = esc + 1;
     }
-    return .{
-        .at = fallback,
-        .mid_run = Redact.isCredChar(pending[fallback - 1]) and
-            Redact.isCredChar(pending[fallback]),
-    };
+    // Always have the redactor mask around such a cut. It judges the
+    // runs on either side on visible text, so a color sequence at the
+    // cut can't make a split token look like two harmless pieces, and
+    // where there is no run nothing is masked.
+    return .{ .at = fallback, .mid_run = true };
 }
 
 const holdback = 4 * 1024;
@@ -471,6 +471,9 @@ test "cutPoint holds back a tail when no point is safe" {
     const c = cutPoint(buf, 4, 8);
     try std.testing.expectEqual(buf.len - holdback, c.at);
     try std.testing.expect(c.mid_run);
+    // A color sequence at the cut doesn't make it look safe.
+    const colored = ("x" ** (3 * holdback - 20)) ++ ":ghp_aBcDeFgHiJ" ++ "\x1b[0mkLmNoPqRsT" ++ ("x" ** holdback);
+    try std.testing.expect(cutPoint(colored, 4, 8).mid_run);
 }
 
 test "cutPoint is linear in the buffer size" {
@@ -570,6 +573,33 @@ test "redacted log masks a token cut inside one giant word" {
     try std.testing.expect(std.mem.indexOf(u8, contents, "PqRsTu") == null);
     try std.testing.expect(std.mem.indexOf(u8, contents, "0123456789") == null);
     try std.testing.expect(std.mem.indexOf(u8, contents, "[REDACTED:truncated]") != null);
+}
+
+test "redacted log masks a token split at a color sequence by a forced cut" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    const io = std.testing.io;
+    const dir = try tmp.dir.realPathFileAlloc(io, ".", alloc);
+    defer alloc.free(dir);
+
+    // The forced cut lands exactly at the ESC inside the token.
+    const head = ("x" ** (hard_max_pending - holdback - 20)) ++ ":ghp_aBcDeFgHiJkLmNo";
+    const tail_part = "\x1b[0mPqRsTuVwXyZ0123456789:";
+    const chunk = head ++ tail_part ++ ("x" ** (holdback - tail_part.len));
+    try std.testing.expectEqual(hard_max_pending, chunk.len);
+
+    var s = try SessionLog.init(alloc, dir, true);
+    s.write(chunk);
+    s.write("\n");
+    s.deinit(alloc);
+
+    var it = tmp.dir.iterate();
+    const entry = (try it.next(io)).?;
+    const contents = try tmp.dir.readFileAlloc(io, entry.name, alloc, .unlimited);
+    defer alloc.free(contents);
+    for ([_][]const u8{ "ghp_", "aBcDeF", "PqRsTu", "0123456789" }) |part|
+        try std.testing.expect(std.mem.indexOf(u8, contents, part) == null);
 }
 
 test "redacted log holds partial lines until complete" {
