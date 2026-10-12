@@ -46,8 +46,10 @@ class SessionLogSearchController: NSWindowController, NSWindowDelegate {
         guard let appDelegate = NSApp.delegate as? AppDelegate else { return }
         var config = Ghostty.SurfaceConfiguration()
         // -j.3 puts the hit a third of the way down rather than on the
-        // top line, so the output leading up to it is visible.
-        config.command = "shell:less -R -j.3 +\(hit.line)g -- \(Self.shellQuote(hit.file.path))"
+        // top line, so the output leading up to it is visible. A surface
+        // command always runs through /bin/sh -c (with no `shell:` prefix
+        // parsing on this path), hence the quoting.
+        config.command = "less -R -j.3 +\(hit.line)g -- \(Self.shellQuote(hit.file.path))"
         config.workingDirectory = hit.file.deletingLastPathComponent().path
         let parent = PasswordManagerController.currentFocusedSurface()?.window
         _ = TerminalController.newTab(appDelegate.ghostty, from: parent, withBaseConfig: config)
