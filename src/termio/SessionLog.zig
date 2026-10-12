@@ -5,14 +5,20 @@
 //!
 //! The log file is opened lazily on the first output and only ever touched
 //! from the thread that processes pty output, so no locking is needed.
-//! Writes are unbuffered so the log is complete up to the last byte even if
-//! the surface is abandoned without being torn down.
+//!
+//! Without redaction, writes are unbuffered so the log is complete up to
+//! the last byte even if the surface is abandoned without being torn down.
+//! With redaction (the default), output is held back until a line is
+//! complete so that a secret split across two reads is still recognized.
+//! The held-back partial line is written when the surface closes, so only
+//! an abandoned surface can lose it.
 const SessionLog = @This();
 
 const std = @import("std");
 const builtin = @import("builtin");
 const Allocator = std.mem.Allocator;
 const global = @import("../global.zig");
+const Redact = @import("Redact.zig");
 
 const log = std.log.scoped(.session_log);
 
@@ -25,21 +31,101 @@ file: ?std.Io.File = null,
 /// Set after an open or write error so we warn once and stop trying.
 failed: bool = false,
 
-pub fn init(alloc: Allocator, dir: ?[]const u8) Allocator.Error!SessionLog {
+/// Masks secrets before they reach the file, or null to log raw output.
+redact: ?Redact = null,
+
+/// Output not yet logged because its line isn't complete (redaction only).
+pending: std.ArrayList(u8) = .empty,
+
+/// Scratch buffer for redacted output, reused across writes.
+scratch: std.ArrayList(u8) = .empty,
+
+alloc: ?Allocator = null,
+
+/// Above this much pending output without a newline, as full-screen
+/// programs produce, the pending output is logged up to its last
+/// whitespace or escape sequence, which no secret pattern spans.
+const max_pending = 16 * 1024;
+
+pub fn init(
+    alloc: Allocator,
+    dir: ?[]const u8,
+    redact: bool,
+) Allocator.Error!SessionLog {
     const d = dir orelse return .{};
     if (d.len == 0) return .{};
-    return .{ .dir = try alloc.dupe(u8, d) };
+    return .{
+        .dir = try alloc.dupe(u8, d),
+        .redact = if (redact) .{} else null,
+        .alloc = alloc,
+    };
 }
 
 pub fn deinit(self: *SessionLog, alloc: Allocator) void {
+    // Log the trailing partial line, such as the final prompt.
+    if (self.pending.items.len > 0) self.logRedacted(self.pending.items);
     if (self.file) |f| f.close(global.io());
     if (self.dir) |d| alloc.free(d);
+    self.pending.deinit(alloc);
+    self.scratch.deinit(alloc);
     self.* = .{};
 }
 
 /// Append pty output to the log. Errors disable logging for this session.
 pub fn write(self: *SessionLog, bytes: []const u8) void {
     if (self.dir == null or self.failed or bytes.len == 0) return;
+    if (self.redact == null) return self.writeFile(bytes);
+
+    const alloc = self.alloc.?;
+    self.pending.appendSlice(alloc, bytes) catch return self.fail(error.OutOfMemory);
+
+    const cut = cutPoint(self.pending.items, max_pending);
+    if (cut == 0) return;
+    self.logRedacted(self.pending.items[0..cut]);
+
+    // Keep the remainder for the next write.
+    const rest = self.pending.items.len - cut;
+    std.mem.copyForwards(u8, self.pending.items[0..rest], self.pending.items[cut..]);
+    self.pending.shrinkRetainingCapacity(rest);
+}
+
+/// How much of `pending` can be redacted and logged now: everything up to
+/// the last newline, or, once over `limit` bytes without one, up to the
+/// last whitespace or escape sequence. 0 means wait for more output.
+fn cutPoint(pending: []const u8, limit: usize) usize {
+    if (std.mem.lastIndexOfScalar(u8, pending, '\n')) |nl| return nl + 1;
+    if (pending.len < limit) return 0;
+    var i = pending.len;
+    while (i > 0) {
+        i -= 1;
+        switch (pending[i]) {
+            // Keep the escape sequence whole for the next write.
+            0x1b => if (i > 0) return i,
+            ' ', '\t', '\r' => return i + 1,
+            else => {},
+        }
+    }
+    // One enormous unbroken run: nothing better to do than log it.
+    return pending.len;
+}
+
+fn logRedacted(self: *SessionLog, bytes: []const u8) void {
+    const alloc = self.alloc.?;
+    self.scratch.clearRetainingCapacity();
+    self.redact.?.redact(alloc, &self.scratch, bytes) catch
+        return self.fail(error.OutOfMemory);
+    self.writeFile(self.scratch.items);
+}
+
+fn fail(self: *SessionLog, err: anyerror) void {
+    log.warn("session log failed, disabling err={}", .{err});
+    if (self.file) |f| f.close(global.io());
+    self.file = null;
+    self.failed = true;
+}
+
+fn writeFile(self: *SessionLog, bytes: []const u8) void {
+    if (self.failed or bytes.len == 0) return;
 
     const file = self.file orelse file: {
         const f = self.open() catch |err| {
@@ -197,8 +283,42 @@ test "utcTime" {
 }
 
 test "disabled log ignores writes" {
-    var s = try SessionLog.init(std.testing.allocator, null);
+    var s = try SessionLog.init(std.testing.allocator, null, true);
     defer s.deinit(std.testing.allocator);
     s.write("hello");
     try std.testing.expect(s.file == null);
+}
+
+test "cutPoint" {
+    // Complete lines are logged, the partial line waits.
+    try std.testing.expectEqual(@as(usize, 5), cutPoint("ab\nc\nde", 64));
+    try std.testing.expectEqual(@as(usize, 0), cutPoint("$ ", 64));
+    // Over the limit: cut after whitespace, or before an escape.
+    try std.testing.expectEqual(@as(usize, 4), cutPoint("abc def", 4));
+    try std.testing.expectEqual(@as(usize, 3), cutPoint("abc\x1b[0mdef", 4));
+    try std.testing.expectEqual(@as(usize, 6), cutPoint("abcdef", 4));
+}
+
+test "redacted log holds partial lines until complete" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    const io = std.testing.io;
+    const dir = try tmp.dir.realPathFileAlloc(io, ".", alloc);
+    defer alloc.free(dir);
+
+    var s = try SessionLog.init(alloc, dir, true);
+    // The token arrives split across two reads.
+    s.write("export GITHUB_TOKEN=ghp_aBcDeFgHiJkLmNo");
+    s.write("PqRsTuVwXyZ0123456789\r\n$ ");
+    s.deinit(alloc);
+
+    var it = tmp.dir.iterate();
+    const entry = (try it.next(io)).?;
+    const contents = try tmp.dir.readFileAlloc(io, entry.name, alloc, .unlimited);
+    defer alloc.free(contents);
+    try std.testing.expectEqualStrings(
+        "export GITHUB_TOKEN=[REDACTED:secret]\r\n$ ",
+        contents,
+    );
 }

@@ -343,6 +343,7 @@ pub fn init(self: *Termio, alloc: Allocator, opts: termio.Options) !void {
         if (opts.full_config.@"session-log-directory") |p| switch (p) {
             .optional, .required => |v| v,
         } else null,
+        opts.full_config.@"session-log-redact",
     );
     errdefer session_log.deinit(alloc);
 

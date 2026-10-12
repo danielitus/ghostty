@@ -1422,15 +1422,39 @@ input: RepeatableReadableIO = .{},
 /// current user. Only output is logged, so keyboard input that the program
 /// doesn't echo (such as passwords at a prompt) is not recorded.
 ///
-/// Logs are never rotated or deleted by Ghostty.
+/// Logs are never rotated or deleted by Ghostty. Well-known secrets are
+/// masked by default; see `session-log-redact`.
 ///
 /// If the path is not absolute, it is considered relative to the directory
 /// of the configuration file that it is referenced from, or from the current
 /// working directory if this is used as a CLI flag. The path may be prefixed
 /// with `~/` to reference the user's home directory.
 ///
+/// See `session-log-redact` for how secrets in the output are handled.
+///
 /// This can be changed at runtime but will only affect new terminal surfaces.
 @"session-log-directory": ?Path = null,
+
+/// If true, well-known secrets are masked in the logs written to
+/// `session-log-directory`. The terminal itself always shows the real
+/// output; only the log is changed. Each secret is replaced with
+/// `[REDACTED:<kind>]`.
+///
+/// Masked: API tokens with a recognizable prefix (AWS access key IDs,
+/// GitHub, Anthropic, OpenAI-style `sk-`, Stripe, Slack, Google API keys),
+/// JWTs, `Bearer` credentials, passwords in URLs (`scheme://user:pass@`),
+/// the value of assignments whose name ends in a secret word such as
+/// `DB_PASSWORD=...`, `"api_key": "..."` or `GITHUB_TOKEN=...`, and the
+/// body of PEM private key blocks. Long hex or base64 strings without a
+/// known prefix (git hashes, container IDs) are not masked, so secrets in
+/// arbitrary formats can still reach the log.
+///
+/// With redaction on, output is written to the log a line at a time
+/// instead of immediately, so a secret split across two reads is still
+/// recognized. The final partial line is written when the surface closes.
+///
+/// This can be changed at runtime but will only affect new terminal surfaces.
+@"session-log-redact": bool = true,
 
 /// Whether to compress scrollback pages while the terminal is idle.
 ///
