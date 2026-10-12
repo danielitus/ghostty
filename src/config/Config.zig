@@ -1451,7 +1451,8 @@ input: RepeatableReadableIO = .{},
 ///
 /// With redaction on, output is written to the log a line at a time
 /// instead of immediately, so a secret split across two reads is still
-/// recognized. The final partial line is written when the surface closes.
+/// recognized. The final partial line is written when the program exits
+/// or the surface closes.
 ///
 /// This can be changed at runtime but will only affect new terminal surfaces.
 @"session-log-redact": bool = true,

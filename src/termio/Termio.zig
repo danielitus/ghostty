@@ -720,6 +720,12 @@ pub fn focusGained(self: *Termio, td: *ThreadData, focused: bool) !void {
     try self.backend.focusGained(td, focused);
 }
 
+/// Called on the thread that processes output once the pty's output has
+/// ended, so nothing held back for the session log is lost.
+pub fn outputEnded(self: *Termio) void {
+    self.session_log.flush();
+}
+
 /// Process output from the pty. This is the manual API that users can
 /// call with pty data but it is also called by the read thread when using
 /// an exec subprocess.

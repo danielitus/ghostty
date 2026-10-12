@@ -1470,6 +1470,11 @@ pub const ReadThread = struct {
             gather_thread.setName(global.io(), "io-gather") catch {};
         }
 
+        // The stream is over once this loop exits: log any output the
+        // session log is holding back, such as a final partial line.
+        // Teardown would do it too, but the app may exit before that.
+        defer io.outputEnded();
+
         // This thread is the parse stage. We consume batches in ring
         // order until the gather stage reports the stream is over and
         // the ring is drained.

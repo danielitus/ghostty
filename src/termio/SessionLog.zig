@@ -10,8 +10,8 @@
 //! the last byte even if the surface is abandoned without being torn down.
 //! With redaction (the default), output is held back until a line is
 //! complete so that a secret split across two reads is still recognized.
-//! The held-back partial line is written when the surface closes, so only
-//! an abandoned surface can lose it.
+//! The held-back partial line is written when the program's output ends or
+//! the surface closes.
 const SessionLog = @This();
 
 const std = @import("std");
@@ -62,13 +62,20 @@ pub fn init(
 }
 
 pub fn deinit(self: *SessionLog, alloc: Allocator) void {
-    // Log the trailing partial line, such as the final prompt.
-    if (self.pending.items.len > 0) self.logRedacted(self.pending.items);
+    self.flush();
     if (self.file) |f| f.close(global.io());
     if (self.dir) |d| alloc.free(d);
     self.pending.deinit(alloc);
     self.scratch.deinit(alloc);
     self.* = .{};
+}
+
+/// Log any output held back waiting for the end of its line, such as the
+/// final prompt. Call when no more output will arrive.
+pub fn flush(self: *SessionLog) void {
+    if (self.pending.items.len == 0) return;
+    if (!self.failed) self.logRedacted(self.pending.items);
+    self.pending.clearRetainingCapacity();
 }
 
 /// Append pty output to the log. Errors disable logging for this session.
