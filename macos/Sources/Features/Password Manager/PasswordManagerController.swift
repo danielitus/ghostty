@@ -209,10 +209,18 @@ class PasswordManagerController: NSWindowController, NSWindowDelegate {
         let windowTitle = surface.window?.title ?? ""
         target.title = windowTitle.isEmpty ? surface.title : windowTitle
 
-        let prompt = surface.passwordInput
+        var prompt = surface.passwordInput
             ? PasswordPrompt.parse(screen: surface.activeScreenText())
             : nil
+        prompt?.foregroundProcess = surface.surfaceModel?.foregroundPID.flatMap(Self.processName)
         if target.prompt != prompt { target.prompt = prompt }
+    }
+
+    /// The executable name of a process, such as `sudo`.
+    private static func processName(_ pid: Int) -> String? {
+        var buf = [CChar](repeating: 0, count: 4 * Int(MAXPATHLEN))
+        guard proc_pidpath(Int32(pid), &buf, UInt32(buf.count)) > 0 else { return nil }
+        return (String(cString: buf) as NSString).lastPathComponent
     }
 
     /// Programs switch the terminal to password mode before printing the

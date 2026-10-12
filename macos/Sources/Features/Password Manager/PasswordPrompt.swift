@@ -28,6 +28,10 @@ struct PasswordPrompt: Equatable {
     var keyFile: String?
     /// The prompt line as shown, for display.
     var line: String
+    /// Name of the terminal's foreground process when the prompt was read
+    /// (`sudo`, `ssh`, …), if known. A sudo prompt is only trusted to be
+    /// for this Mac when sudo itself is asking.
+    var foregroundProcess: String?
 
     /// Short description for the panel, such as "ssh daniel@prod-db".
     var summary: String {
@@ -61,6 +65,13 @@ struct PasswordPrompt: Equatable {
     }
 
     static func parse(line: String) -> PasswordPrompt {
+        // OpenSSH prefixes keyboard-interactive prompts, whose text comes
+        // from the server, with `(user@host)`. Whatever follows is the
+        // server's to choose, including `[sudo] password for …`, so the
+        // prefix decides: it's a password for that host.
+        if let m = line.firstMatch(of: sshParenPattern) {
+            return .init(kind: .ssh, user: String(m.1), host: normalize(host: String(m.2)), line: line)
+        }
         if let m = line.firstMatch(of: sudoPattern) {
             return .init(kind: .sudo, user: String(m.1), line: line)
         }
@@ -71,7 +82,7 @@ struct PasswordPrompt: Equatable {
                 keyFile: (path as NSString).lastPathComponent,
                 line: line)
         }
-        if let m = line.firstMatch(of: sshPattern) ?? line.firstMatch(of: sshParenPattern) {
+        if let m = line.firstMatch(of: sshPattern) {
             return .init(kind: .ssh, user: String(m.1), host: normalize(host: String(m.2)), line: line)
         }
         if let m = line.firstMatch(of: gitPattern) {
@@ -107,9 +118,10 @@ struct PasswordPrompt: Equatable {
     // `daniel@host's password:`
     private static var sshPattern: Regex<(Substring, Substring, Substring)> { try! Regex<(Substring, Substring, Substring)>(
         #"([^\s@'()]+)@([^\s@']+)'s password"#).ignoresCase() }
-    // `(daniel@host) Password:` (OpenSSH 8.4+ keyboard-interactive)
+    // `(daniel@host) Password:` (OpenSSH 8.4+ keyboard-interactive),
+    // anchored: only the client puts this at the start of the line.
     private static var sshParenPattern: Regex<(Substring, Substring, Substring)> { try! Regex<(Substring, Substring, Substring)>(
-        #"\(([^\s@()]+)@([^\s@()]+)\)\s*password"#).ignoresCase() }
+        #"^\(([^\s@()]+)@([^\s@()]+)\)"#).ignoresCase() }
     // `Password for 'https://daniel@github.com':`
     private static var gitPattern: Regex<(Substring, Substring?, Substring)> { try! Regex<(Substring, Substring?, Substring)>(
         #"password for '(?:[a-z][a-z0-9+.-]*://)?(?:([^@'/]+)@)?([^/']+)"#).ignoresCase() }
@@ -139,12 +151,13 @@ struct PasswordPrompt: Equatable {
 
     /// How well `entry` fits this prompt; 0 means it must not be suggested.
     ///
-    /// Each prompt type needs its own evidence: a host match for ssh and
-    /// git, the key name for a key passphrase, a sudo or login label for
-    /// sudo. A matching username only adds to that. On its own it would
-    /// offer, say, a GitHub password to an unknown ssh host just because
-    /// both use the same username, and typing a password into the wrong
-    /// prompt hands it to whoever runs that host.
+    /// Each prompt type needs its own evidence: the exact host for ssh and
+    /// git, the key name for a key passphrase, a sudo or login label for a
+    /// sudo prompt that sudo itself is showing. A matching username only
+    /// adds to that. Typing a password into the wrong prompt hands it to
+    /// whoever runs that host, so near misses never count: `dan` is not
+    /// `daniel`, and an entry for `github.com` is not one for
+    /// `github.attacker.example`.
     func score(_ entry: PasswordEntry, localHost: String) -> Int {
         let label = entry.label.lowercased()
         let username = entry.username.lowercased()
@@ -152,24 +165,21 @@ struct PasswordPrompt: Equatable {
 
         switch kind {
         case .ssh, .git:
-            if let host, !host.isEmpty {
-                if label.contains(host) || username.contains(host) {
-                    evidence = 4
-                } else if let short = host.split(separator: ".").first, short.count >= 3,
-                          label.contains(short) {
-                    evidence = 3
-                }
+            if let host, !host.isEmpty, Self.hosts(in: entry).contains(host) {
+                evidence = 4
             }
         case .sudo:
+            guard let process = foregroundProcess,
+                  ["sudo", "su", "doas"].contains(process) else { break }
             if label.contains("sudo") {
                 evidence = 3
-            } else if !localHost.isEmpty, label.contains(localHost.lowercased()) {
+            } else if !localHost.isEmpty, Self.words(in: label).contains(localHost.lowercased()) {
                 evidence = 2
-            } else if ["login", "local", "mac"].contains(where: label.contains) {
+            } else if ["login", "local", "mac"].contains(where: Self.words(in: label).contains) {
                 evidence = 1
             }
         case .sshKey:
-            if let keyFile, label.contains(keyFile.lowercased()) {
+            if let keyFile, Self.words(in: label).contains(keyFile.lowercased()) {
                 evidence = 4
             } else if label.contains("ssh"), label.contains("key") || label.contains("passphrase") {
                 evidence = 2
@@ -189,6 +199,27 @@ struct PasswordPrompt: Equatable {
             }
         }
         return score
+    }
+
+    /// The hosts an entry names: each word of its label, and the domain of
+    /// an email-style username.
+    static func hosts(in entry: PasswordEntry) -> Set<String> {
+        var hosts = words(in: entry.label.lowercased())
+        let username = entry.username.lowercased()
+        if let at = username.lastIndex(of: "@") {
+            hosts.insert(String(username[username.index(after: at)...]))
+        }
+        return hosts
+    }
+
+    /// Words of a label, keeping the characters of host names and file
+    /// names together: `"Prod DB (db1.example.com)"` has the words `prod`,
+    /// `db` and `db1.example.com`.
+    static func words(in text: String) -> Set<String> {
+        let parts = text.split { c in
+            !(c.isLetter || c.isNumber || c == "." || c == "-" || c == "_")
+        }
+        return Set(parts.map { String($0).trimmingCharacters(in: CharacterSet(charactersIn: ".")) })
     }
 
     /// This Mac's short host name, for matching sudo prompts. Read with
