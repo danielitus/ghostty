@@ -89,6 +89,34 @@ struct SessionLogSearchTests {
         #expect((results.first?.hits.first?.text.count ?? 0) <= SessionLogSearch.maxLineLength + 2)
     }
 
+    private func searchSingleLog(_ contents: String, for query: String) async throws -> [SessionLogSearch.FileResult] {
+        let dir = FileManager.default.temporaryDirectory
+            .appendingPathComponent("ghostty-log-search-\(UUID().uuidString)")
+        try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: dir) }
+        try contents.write(
+            to: dir.appendingPathComponent("20261011_090000.ghostty.1.a.log"),
+            atomically: true, encoding: .utf8)
+        return await SessionLogSearch.search(query, in: dir)
+    }
+
+    /// Text inside a control string (here a window title) is never shown,
+    /// so it must not match, however far the string extends.
+    @Test func controlStringPayloadSpanningBuffersIsHidden() async throws {
+        let payload = String(repeating: "x", count: SessionLogSearch.maxSegment + 2_000)
+        let log = "\u{1b}]0;" + payload + "hiddenneedle\u{07}visible\n"
+        #expect(try await searchSingleLog(log, for: "hiddenneedle").isEmpty)
+        #expect(try await searchSingleLog(log, for: "visible").first?.hits.map(\.line) == [1])
+    }
+
+    /// A query longer than any fixed overlap still matches across the
+    /// point where a long line's buffer is searched and trimmed.
+    @Test func longQueryAcrossBufferBoundary() async throws {
+        let query = String(repeating: "A", count: 5_000) + "Z"
+        let log = String(repeating: "x", count: SessionLogSearch.maxSegment - 2_000) + query + "tail\n"
+        #expect(try await searchSingleLog(log, for: query).first?.hits.map(\.line) == [1])
+    }
+
     @Test func shellQuote() {
         #expect(SessionLogSearchController.shellQuote("/a b/it's.log") == "'/a b/it'\\''s.log'")
     }

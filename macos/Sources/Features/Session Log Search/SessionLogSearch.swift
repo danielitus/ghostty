@@ -33,13 +33,12 @@ enum SessionLogSearch {
     /// Display width kept around a match in very long lines.
     static let maxLineLength = 400
 
-    /// Very long lines are searched this many raw bytes at a time, so
-    /// memory stays bounded and cancellation is prompt.
+    /// Visible text buffered per line before a very long line is searched
+    /// and trimmed, so memory stays bounded.
     static let maxSegment = 64 * 1024
 
-    /// Overlap between segments: longer than any query plus the escape
-    /// sequences that might sit inside a match.
-    static let overlap = 4 * 1024
+    /// Check for cancellation every this many bytes (1 MiB).
+    static let cancelCheckMask = (1 << 20) - 1
 
     /// The log files in `directory`, newest first.
     static func logFiles(in directory: URL) -> [URL] {
@@ -80,54 +79,131 @@ enum SessionLogSearch {
         guard let data = try? Data(contentsOf: file, options: .alwaysMapped) else { return [] }
 
         var hits: [Hit] = []
-        var stripped: [UInt8] = []
-        stripped.reserveCapacity(1024)
+        // The current line's visible text. A very long line (full-screen
+        // programs can write megabytes without a newline) is searched each
+        // time this fills, keeping only enough of its end to complete a
+        // match that started there and to show some context before it.
+        let capacity = max(maxSegment, needle.count * 2)
+        let keep = max(needle.count - 1, maxLineLength / 2)
+        var visible: [UInt8] = []
+        visible.reserveCapacity(capacity + 1)
 
         data.withUnsafeBytes { (raw: UnsafeRawBufferPointer) in
             let bytes = raw.bindMemory(to: UInt8.self)
-            var lineNumber = 0
-            var start = 0
-            while start <= bytes.count {
-                lineNumber += 1
-                var end = start
-                while end < bytes.count && bytes[end] != 0x0A { end += 1 }
+            var stripper = Stripper()
+            var lineNumber = 1
+            var matched = false
 
-                if lineNumber % 4096 == 0 && Task.isCancelled { return }
+            for i in 0..<bytes.count {
+                // Bounded by bytes, not lines, so cancelling is prompt even
+                // inside one enormous line.
+                if i & cancelCheckMask == 0, i > 0, Task.isCancelled { return }
 
-                // Full-screen programs can write megabytes without a
-                // newline. Search such a line in bounded segments, which
-                // overlap so a match across a boundary is still found,
-                // checking for cancellation between them. An escape
-                // sequence cut by a boundary may show a few stray bytes.
-                var segment = start
-                while segment < end || segment == start {
-                    let segmentEnd = min(end, segment + maxSegment)
-                    strip(bytes, from: segment, to: segmentEnd, into: &stripped)
-                    if let at = indexOf(needle, in: stripped) {
-                        hits.append(.init(
-                            file: file,
-                            line: lineNumber,
-                            text: display(stripped, matchAt: at, matchLength: needle.count)))
+                let c = bytes[i]
+                if c == 0x0A {
+                    if !matched {
+                        record(needle, in: visible, file: file, line: lineNumber, into: &hits)
                         if hits.count >= limit { return }
-                        break
                     }
-                    if segmentEnd >= end { break }
-                    if Task.isCancelled { return }
-                    segment = segmentEnd - min(segmentEnd - segment, overlap)
+                    visible.removeAll(keepingCapacity: true)
+                    stripper = Stripper()
+                    matched = false
+                    lineNumber += 1
+                    continue
                 }
 
-                if end >= bytes.count { break }
-                start = end + 1
+                // The rest of a line that already has a hit only matters
+                // for finding the next newline.
+                if matched { continue }
+
+                stripper.feed(c, into: &visible)
+                if visible.count >= capacity {
+                    matched = record(needle, in: visible, file: file, line: lineNumber, into: &hits)
+                    if hits.count >= limit { return }
+                    if !matched { visible.removeFirst(visible.count - keep) }
+                }
+            }
+            if !matched {
+                record(needle, in: visible, file: file, line: lineNumber, into: &hits)
             }
         }
-        return hits
+        return Array(hits.prefix(limit))
+    }
+
+    /// Append a hit if `visible` contains `needle`. Returns whether it did.
+    @discardableResult
+    private static func record(
+        _ needle: [UInt8],
+        in visible: [UInt8],
+        file: URL,
+        line: Int,
+        into hits: inout [Hit]
+    ) -> Bool {
+        guard let at = indexOf(needle, in: visible) else { return false }
+        hits.append(.init(
+            file: file,
+            line: line,
+            text: display(visible, matchAt: at, matchLength: needle.count)))
+        return true
     }
 
     // MARK: Escape stripping
 
-    /// Write `bytes[from..<to]` into `out` without escape sequences or
-    /// control characters (tabs are kept). Backspace removes the previous
-    /// character, so command lines echoed by a line editor read normally.
+    /// Removes escape sequences and control characters from a byte stream,
+    /// one byte at a time, so a sequence is recognized however the stream
+    /// is chunked. Tabs are kept; backspace removes the previous character,
+    /// so command lines echoed by a line editor read normally.
+    struct Stripper {
+        private enum State {
+            case text, escape, csi, string, stringEscape, charset
+        }
+
+        private var state: State = .text
+
+        mutating func feed(_ c: UInt8, into out: inout [UInt8]) {
+            switch state {
+            case .text:
+                switch c {
+                case 0x1B: state = .escape
+                case 0x08:
+                    // Drop one whole UTF-8 character.
+                    while let last = out.popLast(), last & 0xC0 == 0x80 {}
+                case 0x09: out.append(c)
+                case 0x00..<0x20, 0x7F: break
+                default: out.append(c)
+                }
+            case .escape:
+                switch c {
+                case UInt8(ascii: "["): state = .csi
+                // OSC, DCS, APC, PM, SOS: a string until BEL or ST.
+                case UInt8(ascii: "]"), UInt8(ascii: "P"), UInt8(ascii: "_"),
+                     UInt8(ascii: "^"), UInt8(ascii: "X"): state = .string
+                // Charset designation and similar: one more byte.
+                case UInt8(ascii: "("), UInt8(ascii: ")"), UInt8(ascii: "*"),
+                     UInt8(ascii: "+"), UInt8(ascii: "#"), UInt8(ascii: "%"): state = .charset
+                default: state = .text
+                }
+            case .csi:
+                if c == 0x1B {
+                    state = .escape
+                } else if (0x40...0x7E).contains(c) {
+                    state = .text
+                }
+            case .string:
+                if c == 0x07 {
+                    state = .text
+                } else if c == 0x1B {
+                    state = .stringEscape
+                }
+            case .stringEscape:
+                state = c == UInt8(ascii: "\\") ? .text : .string
+            case .charset:
+                state = .text
+            }
+        }
+    }
+
+    /// Strip `bytes[from..<to]` into `out`, replacing its contents.
     static func strip(
         _ bytes: UnsafeBufferPointer<UInt8>,
         from: Int,
@@ -135,54 +211,8 @@ enum SessionLogSearch {
         into out: inout [UInt8]
     ) {
         out.removeAll(keepingCapacity: true)
-        var i = from
-        while i < end {
-            let c = bytes[i]
-            switch c {
-            case 0x1B:
-                i = skipEscape(bytes, at: i, end: end)
-                continue
-            case 0x08:
-                // Drop one whole UTF-8 character.
-                while let last = out.popLast(), last & 0xC0 == 0x80 {}
-            case 0x09:
-                out.append(c)
-            case 0x00..<0x20, 0x7F:
-                break
-            default:
-                out.append(c)
-            }
-            i += 1
-        }
-    }
-
-    /// Index just past the escape sequence starting at `i`.
-    private static func skipEscape(_ b: UnsafeBufferPointer<UInt8>, at i: Int, end: Int) -> Int {
-        var j = i + 1
-        guard j < end else { return end }
-        switch b[j] {
-        case UInt8(ascii: "["):
-            // CSI: parameters, then a final byte in 0x40...0x7E.
-            j += 1
-            while j < end && !(0x40...0x7E).contains(b[j]) { j += 1 }
-            return min(j + 1, end)
-        case UInt8(ascii: "]"), UInt8(ascii: "P"), UInt8(ascii: "_"),
-             UInt8(ascii: "^"), UInt8(ascii: "X"):
-            // OSC, DCS, APC, PM, SOS: until BEL or ST (ESC \).
-            j += 1
-            while j < end {
-                if b[j] == 0x07 { return j + 1 }
-                if b[j] == 0x1B && j + 1 < end && b[j + 1] == UInt8(ascii: "\\") { return j + 2 }
-                j += 1
-            }
-            return end
-        case UInt8(ascii: "("), UInt8(ascii: ")"), UInt8(ascii: "*"),
-             UInt8(ascii: "+"), UInt8(ascii: "#"), UInt8(ascii: "%"):
-            // Charset designation and similar: one more byte.
-            return min(j + 2, end)
-        default:
-            return j + 1
-        }
+        var stripper = Stripper()
+        for i in from..<end { stripper.feed(bytes[i], into: &out) }
     }
 
     // MARK: Matching
