@@ -168,9 +168,16 @@ pub fn isRunning(self: *DisplayLink) bool {
 /// writer of the requested state, so no compare-and-swap is needed.
 pub fn setRunning(self: *DisplayLink, running: bool) void {
     var requested = self.requested.load(.seq_cst);
+    const changed = requested.running != running;
     requested.running = running;
     self.requested.store(requested, .seq_cst);
-    if (running != self.link.isRunning()) self.queueSync();
+
+    // A changed request always queues a sync, even if it matches the
+    // link's current state: a sync already running on the main thread
+    // may have read the previous request and be about to apply it
+    // (e.g. stop a link we now want running), and nothing else would
+    // queue the sync that corrects it.
+    if (changed or running != self.link.isRunning()) self.queueSync();
 }
 
 /// Request that the link be bound to the given CGDirectDisplayID, so
