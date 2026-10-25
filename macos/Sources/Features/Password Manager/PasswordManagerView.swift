@@ -277,6 +277,9 @@ private struct PasswordListView: View {
                             }
                         }
                         .padding(.vertical, 2)
+                        // Fill the row so a double-click on the blank
+                        // area past the text sends too, not just on it.
+                        .frame(maxWidth: .infinity, alignment: .leading)
                         .contentShape(Rectangle())
                         .simultaneousGesture(TapGesture(count: 2).onEnded {
                             selection = entry.id
