@@ -42,11 +42,17 @@ pub const ProcessInfo = enum {
     /// Gets the name of the slave PTY. Returned name points to an internal buffer
     /// so it should not be modified or freed.
     tty_name,
+    /// Whether the PTY is at a password prompt right now: canonical mode
+    /// with echo off, the same heuristic the termios poll uses. Read from
+    /// the PTY on each call, so it is current even while the poll is
+    /// paused because the surface is unfocused.
+    password_input,
 
     pub fn Type(comptime info: ProcessInfo) type {
         return switch (info) {
             .foreground_pid => u64,
             .tty_name => [:0]const u8,
+            .password_input => bool,
         };
     }
 };
@@ -318,6 +324,10 @@ const PosixPty = struct {
                     else => return null,
                 }
             },
+            .password_input => {
+                const mode = self.getMode() catch return null;
+                return mode.canonical and !mode.echo;
+            },
         };
     }
 };
@@ -516,5 +526,21 @@ test {
         .linux => try testing.expect(std.mem.startsWith(u8, pty.getProcessInfo(.tty_name).?, "/dev/pts/")),
         .macos => try testing.expect(std.mem.startsWith(u8, pty.getProcessInfo(.tty_name).?, "/dev/")),
         else => try testing.expect(pty.getProcessInfo(.tty_name) == null),
+    }
+
+    switch (builtin.target.os.tag) {
+        .freebsd, .linux, .macos => {
+            // A fresh PTY echoes, so it isn't at a password prompt...
+            try testing.expectEqual(false, pty.getProcessInfo(.password_input).?);
+
+            // ...until echo is turned off, as sudo or ssh do.
+            const c = PosixPty.c;
+            var attrs: c.termios = undefined;
+            try testing.expectEqual(0, c.tcgetattr(pty.slave, &attrs));
+            attrs.c_lflag &= ~@as(@TypeOf(attrs.c_lflag), c.ECHO);
+            try testing.expectEqual(0, c.tcsetattr(pty.slave, c.TCSANOW, &attrs));
+            try testing.expectEqual(true, pty.getProcessInfo(.password_input).?);
+        },
+        else => try testing.expect(pty.getProcessInfo(.password_input) == null),
     }
 }

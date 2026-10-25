@@ -2078,6 +2078,12 @@ pub const CAPI = struct {
         return surface.core_surface.getProcessInfo(.foreground_pid) orelse 0;
     }
 
+    /// Returns whether the surface PTY is at a password prompt (canonical
+    /// mode, echo off), read from the PTY now. False if it can't be read.
+    export fn ghostty_surface_password_input(surface: *Surface) bool {
+        return surface.core_surface.getProcessInfo(.password_input) orelse false;
+    }
+
     /// Returns the PTY name for the surface. The returned string must be
     /// freed by the caller via ghostty_string_free.
     export fn ghostty_surface_tty_name(surface: *Surface) String {

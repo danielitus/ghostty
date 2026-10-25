@@ -164,9 +164,11 @@ class PasswordManagerController: NSWindowController, NSWindowDelegate {
             return
         }
 
-        // Checked on the surface resolved just now, not the displayed
-        // target, which can lag behind a prompt that already ended.
-        if onlyAtPrompt && !surface.passwordInput {
+        // Ask the PTY itself: `surface.passwordInput` stops updating once
+        // the panel takes focus from the terminal, and it also follows a
+        // manual Secure Input toggle. A prompt ending between this check
+        // and the write can still slip through; that window is tiny.
+        if onlyAtPrompt && !model.atPasswordPrompt {
             NSSound.beep()
             refreshTarget()
             return

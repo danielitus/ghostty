@@ -135,6 +135,15 @@ extension Ghostty {
             return Int(exactly: pid)
         }
 
+        /// Whether the PTY is at a password prompt right now, read from the
+        /// PTY on each access. Unlike `SurfaceView.passwordInput`, this
+        /// isn't stale while the surface is unfocused, and it isn't the
+        /// macOS Secure Input state, which can also be toggled by hand.
+        @MainActor
+        var atPasswordPrompt: Bool {
+            ghostty_surface_password_input(surface)
+        }
+
         /// The PTY device name for this surface.
         @MainActor
         var ttyName: String? {

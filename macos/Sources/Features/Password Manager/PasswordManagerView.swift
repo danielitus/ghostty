@@ -283,7 +283,8 @@ private struct PasswordListView: View {
                         .frame(maxWidth: .infinity, alignment: .leading)
                         .contentShape(Rectangle())
                         // A double-click is easy to make by accident, so it
-                        // only sends into a password prompt: anywhere else
+                        // only sends into a password prompt (canonical mode,
+                        // echo off, as the PTY reports it): anywhere else
                         // the password would echo, land in the session log
                         // and maybe the shell history. Send Password and
                         // the context menu are deliberate and always send.
