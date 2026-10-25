@@ -245,7 +245,7 @@ fn threadMain_(self: *Thread) !void {
     // Right now, on Darwin, `std.Thread.setName` can only name the current
     // thread, and we have no way to get the current thread from within it,
     // so instead we use this code to name the thread instead.
-    if (builtin.os.tag.isDarwin()) {
+    if (builtin.target.os.tag.isDarwin()) {
         internal_os.macos.pthread_setname_np(&"renderer".*);
     }
 
@@ -334,11 +334,11 @@ fn drainMailbox(self: *Thread) !void {
     //
     // This is effectively an @autoreleasepool{} block, which we need in
     // order to ensure that autoreleased objects are properly released.
-    const pool = if (builtin.os.tag.isDarwin())
+    const pool = if (builtin.target.os.tag.isDarwin())
         @import("objc").AutoreleasePool.init()
     else
         void;
-    defer if (builtin.os.tag.isDarwin()) pool.deinit();
+    defer if (builtin.target.os.tag.isDarwin()) pool.deinit();
 
     // Note the need for reconciliation up front, independently of how
     // much of this batch we get through (a handler may fail partway):

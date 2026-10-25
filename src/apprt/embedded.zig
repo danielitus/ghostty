@@ -254,7 +254,7 @@ pub const App = struct {
     /// to run on every keypress.
     pub fn keyboardLayout(self: *App) input.KeyboardLayout {
         // We only support keyboard layout detection on macOS.
-        if (comptime builtin.os.tag != .macos) return .unknown;
+        if (comptime builtin.target.os.tag != .macos) return .unknown;
 
         // Lazily initialize the keymap.
         const keymap: *input.Keymap = keymap: {
@@ -358,7 +358,7 @@ pub const App = struct {
                     // error we just ignore it, since this only breaks a few minor things.
                     const alloc = self.core_app.alloc;
                     if (surface.rt_surface.title) |v| alloc.free(v);
-                    surface.rt_surface.title = alloc.dupeZ(u8, value.title) catch null;
+                    surface.rt_surface.title = alloc.dupeSentinel(u8, value.title, 0) catch null;
                 },
             },
 
@@ -602,8 +602,8 @@ pub const Surface = struct {
                 const value = std.mem.sliceTo(env_var.value, 0);
                 try config.env.map.put(
                     alloc,
-                    try alloc.dupeZ(u8, key),
-                    try alloc.dupeZ(u8, value),
+                    try alloc.dupeSentinel(u8, key, 0),
+                    try alloc.dupeSentinel(u8, value, 0),
                 );
             }
         }
@@ -825,7 +825,7 @@ pub const Surface = struct {
 
         const result = self.app.opts.read_clipboard(
             self.userdata,
-            @intCast(@intFromEnum(clipboard_type)),
+            @intCast(@backingInt(clipboard_type)),
             state_ptr,
             mimes.ptr,
             mimes.len,
@@ -856,8 +856,9 @@ pub const Surface = struct {
             error.UnauthorizedPaste => {
                 // Convert the would-be contents so the permission
                 // prompt can display exactly what would be written.
-                var stack = std.heap.stackFallback(1024, alloc);
-                const conv_alloc = stack.get();
+                var stack_buf: [1024]u8 = undefined;
+                var stack: std.heap.BufferFirstAllocator = .init(&stack_buf, alloc);
+                const conv_alloc = stack.allocator();
                 const contents = conv_alloc.alloc(
                     CAPI.ClipboardContent,
                     kitty.contents.len,
@@ -908,8 +909,9 @@ pub const Surface = struct {
 
         // Convert the C representations to the core types. Everything
         // remains borrowed from the caller for the duration of the call.
-        var stack = std.heap.stackFallback(1024, alloc);
-        const conv_alloc = stack.get();
+        var stack_buf: [1024]u8 = undefined;
+        var stack: std.heap.BufferFirstAllocator = .init(&stack_buf, alloc);
+        const conv_alloc = stack.allocator();
 
         const raw_contents: []const CAPI.ClipboardContent =
             if (complete.contents) |v| v[0..complete.contents_len] else &.{};
@@ -1015,7 +1017,7 @@ pub const Surface = struct {
 
         self.app.opts.write_clipboard(
             self.userdata,
-            @intCast(@intFromEnum(clipboard_type)),
+            @intCast(@backingInt(clipboard_type)),
             array.ptr,
             array.len,
             confirm,
@@ -1237,7 +1239,7 @@ pub const Surface = struct {
             if (!apprt.surface.shouldInheritWorkingDirectory(context, &self.app.config)) break :wd null;
             const cwd = self.core_surface.pwd(self.app.core_app.alloc) catch null orelse break :wd null;
             defer self.app.core_app.alloc.free(cwd);
-            break :wd self.app.core_app.alloc.dupeZ(u8, cwd) catch null;
+            break :wd self.app.core_app.alloc.dupeSentinel(u8, cwd, 0) catch null;
         };
 
         return .{
@@ -2080,7 +2082,7 @@ pub const CAPI = struct {
     /// freed by the caller via ghostty_string_free.
     export fn ghostty_surface_tty_name(surface: *Surface) String {
         const tty_name = surface.core_surface.getProcessInfo(.tty_name) orelse return .empty;
-        const copy = surface.app.core_app.alloc.dupeZ(u8, tty_name) catch |err| {
+        const copy = surface.app.core_app.alloc.dupeSentinel(u8, tty_name, 0) catch |err| {
             log.err("error allocating tty name err={}", .{err});
             return .empty;
         };
