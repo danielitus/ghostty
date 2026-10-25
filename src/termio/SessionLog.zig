@@ -314,7 +314,7 @@ fn open(self: *SessionLog) !std.Io.File {
         std.mem.readInt(u32, &rand, .little),
     );
 
-    const file = try dir.createFile(io, name, switch (builtin.os.tag) {
+    const file = try dir.createFile(io, name, switch (builtin.target.os.tag) {
         .windows => .{ .exclusive = true },
         // Logs capture everything shown in the terminal, so keep them
         // private to the user.
@@ -346,7 +346,7 @@ pub fn filename(buf: []u8, t: Time, pid: u64, random: u32) ![]const u8 {
 }
 
 fn processId() u64 {
-    return switch (builtin.os.tag) {
+    return switch (builtin.target.os.tag) {
         .windows => std.os.windows.GetCurrentProcessId(),
         else => @intCast(std.c.getpid()),
     };
@@ -373,7 +373,7 @@ extern "c" fn localtime_r(timep: *const c_long, result: *Tm) ?*Tm;
 /// Local time for `secs` since the epoch, falling back to UTC where
 /// libc's localtime_r isn't available or fails.
 fn localTime(secs: i64) Time {
-    if (comptime builtin.os.tag != .windows and builtin.link_libc) local: {
+    if (comptime builtin.target.os.tag != .windows and builtin.link_libc) local: {
         const t: c_long = @intCast(secs);
         var tm: Tm = undefined;
         _ = localtime_r(&t, &tm) orelse break :local;
@@ -404,6 +404,11 @@ fn utcTime(secs: i64) Time {
         .minute = ds.getMinutesIntoHour(),
         .second = ds.getSecondsIntoMinute(),
     };
+}
+
+/// `n` filler bytes for tests (Zig 0.17 dropped the `**` operator).
+fn xs(comptime n: usize) *const [n]u8 {
+    return comptime &@as([n]u8, @splat('x'));
 }
 
 test "filename" {
@@ -466,13 +471,13 @@ test "cutPoint never splits a secret" {
 }
 
 test "cutPoint holds back a tail when no point is safe" {
-    const run = "x" ** (3 * holdback);
+    const run = xs(3 * holdback);
     const buf = run ++ ":ghp_aBcDeF";
     const c = cutPoint(buf, 4, 8);
     try std.testing.expectEqual(buf.len - holdback, c.at);
     try std.testing.expect(c.mid_run);
     // A color sequence at the cut doesn't make it look safe.
-    const colored = ("x" ** (3 * holdback - 20)) ++ ":ghp_aBcDeFgHiJ" ++ "\x1b[0mkLmNoPqRsT" ++ ("x" ** holdback);
+    const colored = (xs(3 * holdback - 20)) ++ ":ghp_aBcDeFgHiJ" ++ "\x1b[0mkLmNoPqRsT" ++ (xs(holdback));
     try std.testing.expect(cutPoint(colored, 4, 8).mid_run);
 }
 
@@ -495,7 +500,7 @@ test "redacted log keeps a long line whole up to the hard limit" {
     const dir = try tmp.dir.realPathFileAlloc(io, ".", alloc);
     defer alloc.free(dir);
 
-    const filler = "x" ** (max_pending + 10);
+    const filler = xs(max_pending + 10);
     var s = try SessionLog.init(alloc, dir, true);
     s.write(filler ++ " PASSWORD=\"correct horse ");
     s.write("battery staple\" :ghp_aBcDeFgHiJkLmNo");
@@ -520,7 +525,7 @@ test "redacted log never splits a secret at the hard limit" {
     const dir = try tmp.dir.realPathFileAlloc(io, ".", alloc);
     defer alloc.free(dir);
 
-    const filler = "x" ** hard_max_pending;
+    const filler = xs(hard_max_pending);
     var s = try SessionLog.init(alloc, dir, true);
     // A token cut by the read boundary, with no safe point before it.
     s.write(filler ++ ":ghp_aBcDeFgHiJkLmNo");
@@ -556,8 +561,8 @@ test "redacted log masks a token cut inside one giant word" {
     // write with no blank anywhere.
     // Assembled from pieces so secret scanners don't flag the fake token.
     const token = "gh" ++ "p_" ++ "aBcDeFgHiJkLmNoPqRsTuVwXyZ0123456789";
-    const before = "x" ** (hard_max_pending - holdback - 21);
-    const after = "x" ** (holdback - token.len - 2 + 21);
+    const before = xs(hard_max_pending - holdback - 21);
+    const after = xs(holdback - token.len - 2 + 21);
     const chunk = before ++ ":" ++ token ++ ":" ++ after;
     try std.testing.expectEqual(hard_max_pending, chunk.len);
 
@@ -585,9 +590,9 @@ test "redacted log masks a token split at a color sequence by a forced cut" {
     defer alloc.free(dir);
 
     // The forced cut lands exactly at the ESC inside the token.
-    const head = ("x" ** (hard_max_pending - holdback - 20)) ++ ":ghp_aBcDeFgHiJkLmNo";
+    const head = (xs(hard_max_pending - holdback - 20)) ++ ":ghp_aBcDeFgHiJkLmNo";
     const tail_part = "\x1b[0mPqRsTuVwXyZ0123456789:";
-    const chunk = head ++ tail_part ++ ("x" ** (holdback - tail_part.len));
+    const chunk = head ++ tail_part ++ (xs(holdback - tail_part.len));
     try std.testing.expectEqual(hard_max_pending, chunk.len);
 
     var s = try SessionLog.init(alloc, dir, true);
