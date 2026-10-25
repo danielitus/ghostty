@@ -58,8 +58,8 @@ class PasswordManagerController: NSWindowController, NSWindowDelegate {
         panel.delegate = self
         panel.contentView = NSHostingView(rootView: PasswordManagerView(
             target: target,
-            onSend: { [weak self] text, pressEnter in
-                self?.send(text, pressEnter: pressEnter)
+            onSend: { [weak self] text, pressEnter, onlyAtPrompt in
+                self?.send(text, pressEnter: pressEnter, onlyAtPrompt: onlyAtPrompt)
             }))
 
         // Keep the displayed target in step with window ordering and
@@ -152,13 +152,21 @@ class PasswordManagerController: NSWindowController, NSWindowDelegate {
 
     // MARK: - Sending
 
-    private func send(_ text: String, pressEnter: Bool) {
+    private func send(_ text: String, pressEnter: Bool, onlyAtPrompt: Bool) {
         // Resolve the target now: the focused surface of the frontmost
         // terminal window. Anything remembered from when the panel opened
         // could point at a terminal the user has since switched away from.
         guard let surface = Self.currentFocusedSurface(),
               let targetWindow = surface.window,
               let model = surface.surfaceModel else {
+            NSSound.beep()
+            refreshTarget()
+            return
+        }
+
+        // Checked on the surface resolved just now, not the displayed
+        // target, which can lag behind a prompt that already ended.
+        if onlyAtPrompt && !surface.passwordInput {
             NSSound.beep()
             refreshTarget()
             return

@@ -4,9 +4,10 @@ struct PasswordManagerView: View {
     @ObservedObject var vault: PasswordVault = .shared
     @ObservedObject var target: PasswordManagerTarget
 
-    /// Called with the text to type into the target terminal surface and
-    /// whether to press Enter afterwards.
-    var onSend: (String, Bool) -> Void
+    /// Called with the text to type into the target terminal surface,
+    /// whether to press Enter afterwards, and whether to send only if
+    /// that terminal is at a password prompt.
+    var onSend: (String, Bool, Bool) -> Void
 
     var body: some View {
         Group {
@@ -170,7 +171,7 @@ private struct PasswordVaultUnlockView: View {
 private struct PasswordListView: View {
     @ObservedObject var vault: PasswordVault
     @ObservedObject var target: PasswordManagerTarget
-    var onSend: (String, Bool) -> Void
+    var onSend: (String, Bool, Bool) -> Void
 
     @State private var search = ""
     @State private var selection: UUID?
@@ -281,9 +282,14 @@ private struct PasswordListView: View {
                         // area past the text sends too, not just on it.
                         .frame(maxWidth: .infinity, alignment: .leading)
                         .contentShape(Rectangle())
+                        // A double-click is easy to make by accident, so it
+                        // only sends into a password prompt: anywhere else
+                        // the password would echo, land in the session log
+                        // and maybe the shell history. Send Password and
+                        // the context menu are deliberate and always send.
                         .simultaneousGesture(TapGesture(count: 2).onEnded {
                             selection = entry.id
-                            send(entry.password)
+                            send(entry.password, onlyAtPrompt: true)
                         })
                         .tag(entry.id)
                         .contextMenu {
@@ -484,7 +490,7 @@ private struct PasswordListView: View {
         }
     }
 
-    private func send(_ text: String?) {
+    private func send(_ text: String?, onlyAtPrompt: Bool = false) {
         guard let text, !text.isEmpty else { return }
         // Strip control characters so a stored value can never inject key
         // presses beyond the credential itself. Enter, when enabled, is
@@ -496,7 +502,7 @@ private struct PasswordListView: View {
             $0.value >= 0x20 && !(0x7F...0x9F).contains($0.value)
         })
         guard !clean.isEmpty else { return }
-        onSend(clean, pressEnter)
+        onSend(clean, pressEnter, onlyAtPrompt)
     }
 }
 
